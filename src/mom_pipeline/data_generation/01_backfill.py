@@ -12,7 +12,7 @@
 # COMMAND ----------
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
+from pyspark.sql import functions as F
 from pyspark.sql.types import *
 from faker import Faker
 import random
@@ -149,7 +149,7 @@ for day_offset in range(BACKFILL_DAYS):
     # Randomly mutate a few fields to simulate changes
     mutated_users = users_df.withColumn(
         "status",
-        when(rand() < 0.02, lit("inactive")).otherwise(col("status"))
+        F.when(F.rand() < 0.02, F.lit("inactive")).otherwise(F.col("status"))
     )
     write_csv(mutated_users, date_path("users", dt))
 
