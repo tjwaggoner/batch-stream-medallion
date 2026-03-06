@@ -229,6 +229,19 @@ All pre-bronze tables include metadata columns:
 - `_ingested_at` — `current_timestamp()`
 - `_source_file` — `_metadata.file_path` (batch) or `NULL` (stream)
 - `_source_type` — `'batch'` or `'stream'`
+- `_rescued_data` — JSON string containing any columns not in the current schema (see below)
+
+#### Schema Evolution Strategy
+
+All Auto Loader batch sources use **`rescue` mode** (`cloudFiles.schemaEvolutionMode = "rescue"`). When a partner file arrives with new or unexpected columns, the pipeline continues running — the new columns are captured as JSON in a `_rescued_data` column rather than being added to the table schema automatically or failing the pipeline.
+
+This approach fits the pre-bronze layer's role as an immutable audit trail:
+- **No data is lost** — unexpected fields are preserved in `_rescued_data` and can be inspected
+- **Pipeline stays running** — no manual intervention required when upstream schemas change
+- **Schema changes are intentional** — new columns are promoted to the table schema only after review, by updating the `read_files()` schema hint in the SQL definition
+- **Downstream layers are insulated** — bronze, silver, and gold are unaffected until the pre-bronze schema is explicitly updated
+
+Schema location for Auto Loader inference is stored at: `/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas`
 
 ### 5.2 Bronze Layer — Merged / Current State
 
@@ -485,6 +498,7 @@ When building this pipeline with the AI Dev Kit Claude Code plugin, follow these
 - [ ] Compute: Serverless
 - [ ] All tables use `CLUSTER BY` (not `PARTITION BY`)
 - [ ] Pre-bronze streaming tables use `FROM STREAM read_files(...)` for batch sources
+- [ ] Auto Loader uses `rescue` schema evolution mode with `_rescued_data` column
 - [ ] Bronze tables implement AUTO CDC (SCD Type 1) merge from pre-bronze
 - [ ] Silver tables implement cross-source joins and static-stream join
 - [ ] Gold materialized views reference silver tables correctly
