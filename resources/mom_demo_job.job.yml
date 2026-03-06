@@ -1,0 +1,44 @@
+resources:
+  jobs:
+    mom_demo_job:
+      name: "mom_demo_live_data"
+      tasks:
+        - task_key: generate_batch_files
+          notebook_task:
+            notebook_path: /Workspace/Users/tanner.waggoner@databricks.com/mom_data_generation/02_live_batch_generator
+            source: WORKSPACE
+          environment_key: default
+          timeout_seconds: 300
+
+        - task_key: generate_stream_events
+          notebook_task:
+            notebook_path: /Workspace/Users/tanner.waggoner@databricks.com/mom_data_generation/03_live_stream_producer
+            source: WORKSPACE
+          environment_key: default
+          timeout_seconds: 120
+
+        - task_key: refresh_pipeline
+          depends_on:
+            - task_key: generate_batch_files
+            - task_key: generate_stream_events
+          pipeline_task:
+            pipeline_id: 2c9b65f9-3582-49f9-b1ee-43453f9b4dc9
+            full_refresh: false
+          timeout_seconds: 600
+
+        - task_key: check_latency
+          depends_on:
+            - task_key: refresh_pipeline
+          notebook_task:
+            notebook_path: /Workspace/Users/tanner.waggoner@databricks.com/mom_data_generation/04_latency_monitor
+            source: WORKSPACE
+          environment_key: default
+          timeout_seconds: 300
+
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+
+      queue:
+        enabled: true
