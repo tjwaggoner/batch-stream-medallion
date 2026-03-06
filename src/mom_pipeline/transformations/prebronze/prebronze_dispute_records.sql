@@ -7,7 +7,7 @@ SELECT
   _metadata.file_path AS _source_file,
   'batch' AS _source_type
 FROM STREAM read_files(
-  '${source_volume}/dispute_records/',
+  '${source_volume}/disputes/',
   format => 'csv',
   header => true,
   schemaEvolutionMode => 'rescue',
