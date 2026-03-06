@@ -51,7 +51,7 @@ This addresses common pain points in fintech data architectures:
          ▼                                 ▼
 ┌──────────────────────────────────────────────────────────┐
 │          PRE-BRONZE LAYER (Raw / Append-Only)            │
-│  waggoner.mom_prebronze                                  │
+│  waggoner_mom.prebronze                                  │
 │                                                          │
 │  Immutable audit trail. Every file and event lands here  │
 │  as-is. No dedup, no merge. Metadata columns added.     │
@@ -79,7 +79,7 @@ This addresses common pain points in fintech data architectures:
                               ▼
 ┌──────────────────────────────────────────────────────────┐
 │          BRONZE LAYER (Merged / Current State)           │
-│  waggoner.mom_bronze                                     │
+│  waggoner_mom.bronze                                     │
 │                                                          │
 │  Merge/upsert from pre-bronze. Deduplicates full         │
 │  snapshots, applies SCD Type 1. One clean current-state  │
@@ -109,7 +109,7 @@ This addresses common pain points in fintech data architectures:
                               ▼
 ┌──────────────────────────────────────────────────────────┐
 │              SILVER LAYER (3NF / Conformed)              │
-│  waggoner.mom_silver                                     │
+│  waggoner_mom.silver                                     │
 │                                                          │
 │  3NF normalized entity tables. Cross-source joins,       │
 │  static-stream joins (merged bronze batch + streaming    │
@@ -135,7 +135,7 @@ This addresses common pain points in fintech data architectures:
                               ▼
 ┌──────────────────────────────────────────────────────────┐
 │              GOLD LAYER (Analytics)                      │
-│  waggoner.mom_gold                                       │
+│  waggoner_mom.gold                                       │
 │  ┌────────────────────────────────────────────────────┐  │
 │  │ Denormalized / aggregation tables:                 │  │
 │  │ - fact_daily_transactions                          │  │
@@ -161,13 +161,13 @@ This addresses common pain points in fintech data architectures:
 | Setting | Value |
 |---------|-------|
 | **Workspace** | `e2-demo-field-eng.cloud.databricks.com` (profile: `e2-field`) |
-| **Catalog** | `waggoner` (existing) |
-| **Pre-Bronze Schema** | `mom_prebronze` |
-| **Bronze Schema** | `mom_bronze` |
-| **Silver Schema** | `mom_silver` |
-| **Gold Schema** | `mom_gold` |
-| **Volume (batch source)** | `/Volumes/waggoner/mom_prebronze/partner_files/` |
-| **Schema Metadata Volume** | `/Volumes/waggoner/mom_prebronze/pipeline_metadata/schemas` |
+| **Catalog** | `waggoner_mom` (new) |
+| **Pre-Bronze Schema** | `prebronze` |
+| **Bronze Schema** | `bronze` |
+| **Silver Schema** | `silver` |
+| **Gold Schema** | `gold` |
+| **Volume (batch source)** | `/Volumes/waggoner_mom/prebronze/partner_files/` |
+| **Schema Metadata Volume** | `/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas` |
 | **Compute** | Serverless (SDP default) |
 
 ---
@@ -356,14 +356,14 @@ resources:
   pipelines:
     mom_pipeline:
       name: "mom_medallion_pipeline"
-      catalog: "waggoner"
-      schema: "mom_prebronze"  # default target = pre-bronze
+      catalog: "waggoner_mom"
+      schema: "prebronze"  # default target = pre-bronze
       configuration:
-        bronze_schema: "mom_bronze"
-        silver_schema: "mom_silver"
-        gold_schema: "mom_gold"
-        source_volume: "/Volumes/waggoner/mom_prebronze/partner_files"
-        schema_location_base: "/Volumes/waggoner/mom_prebronze/pipeline_metadata/schemas"
+        bronze_schema: "bronze"
+        silver_schema: "silver"
+        gold_schema: "gold"
+        source_volume: "/Volumes/waggoner_mom/prebronze/partner_files"
+        schema_location_base: "/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas"
 ```
 
 ### 6.3 File Structure
@@ -453,7 +453,7 @@ When building this pipeline with the AI Dev Kit Claude Code plugin, follow these
 ### Project Initialization
 - Use `databricks pipelines init` to scaffold the Asset Bundle project
 - Select **SQL** as the language
-- Set initial catalog to `waggoner`
+- Set initial catalog to `waggoner_mom`
 
 ### SDP Best Practices
 - **Import**: Not needed for SQL pipelines
@@ -465,7 +465,7 @@ When building this pipeline with the AI Dev Kit Claude Code plugin, follow these
 - **Modern defaults**: Serverless compute, Unity Catalog, raw `.sql` files (not notebooks)
 
 ### Multi-Schema Pattern
-- Pipeline default catalog/schema = `waggoner.mom_prebronze`
+- Pipeline default catalog/schema = `waggoner_mom.prebronze`
 - Bronze, silver, and gold schemas referenced via pipeline configuration parameters
 - Bronze tables use: `${bronze_schema}.bronze_users`
 - Silver tables use: `${silver_schema}.silver_users`
@@ -575,7 +575,7 @@ The pipeline should run in **continuous mode** (or triggered every 1-2 minutes) 
 | **Backfill script** | Python notebook using Faker + Spark | Use `databricks-synthetic-data-generation` AI Dev Kit skill |
 | **Live batch generator** | Python notebook, scheduled as Databricks Job (every 2 min) | Writes CSV/JSON files to S3 volume |
 | **Live stream producer** | Python notebook, long-running Databricks Job task | Kafka producer or file-based fallback |
-| **Shared ID pool** | Generated once during backfill, stored as Delta table in `mom_prebronze` | `_entity_ids` table with `user_id`, `account_id`, `card_id` pools |
+| **Shared ID pool** | Generated once during backfill, stored as Delta table in `prebronze` | `_entity_ids` table with `user_id`, `account_id`, `card_id` pools |
 | **Pipeline mode** | Continuous or triggered (1-2 min interval) | Required to meet 5-min streaming SLA |
 
 ### 8.4 Data Relationships
@@ -606,7 +606,7 @@ A **Databricks Genie Space** will be created on top of the gold layer to enable 
 | Setting | Value |
 |---------|-------|
 | **Genie Space Name** | `MOM Analytics` |
-| **Source Tables** | All `mom_gold` tables and metric views |
+| **Source Tables** | All `gold` tables and metric views |
 | **Warehouse** | Serverless SQL warehouse |
 
 ### Included Tables
