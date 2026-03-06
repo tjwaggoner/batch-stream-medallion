@@ -497,33 +497,103 @@ When building this pipeline with the AI Dev Kit Claude Code plugin, follow these
 
 ## 8. Synthetic Data Generation
 
-Since this is a demo, synthetic data will simulate realistic fintech volumes (scaled down ~100x). All batch sources are generated as files in the S3 volume; streaming is simulated via Kafka producer or file-based fallback.
+Since this is a demo, synthetic data simulates realistic fintech volumes (scaled down ~100x). Data generation runs in **two phases** to ensure gold tables are populated before the demo and data is flowing live to demonstrate SLA compliance.
 
-**Batch Sources (Partner Data Files → S3 Volume):**
+### 8.1 Phase 1: Historical Backfill (One-Shot)
 
-| Data Type | Real Volume/Day | Demo Volume | Generation Method |
-|-----------|----------------|-------------|-------------------|
-| Users | 10,200,000 rows | ~100K rows | CSV files in S3 volume |
-| Linked Accounts | 6,100,000 rows | ~60K rows | CSV files in S3 volume |
-| Account Balances | 5,000,000 rows | ~50K rows | CSV files in S3 volume |
-| Alerts | 2,000,000 rows | ~20K rows | CSV files in S3 volume |
-| Payment Events | 1,400,000 rows | ~14K rows | CSV files in S3 volume |
-| Card Payments | 580,000 rows | ~6K rows | CSV files in S3 volume |
-| Settled Payments | 420,000 rows | ~4K rows | CSV files in S3 volume |
-| Wire Transfers | 350,000 rows | ~4K rows | CSV files in S3 volume |
-| Verification Checks | 140,000 rows | ~1K rows | CSV files in S3 volume |
-| Portal Activity | 130,000 rows | ~1K rows | CSV files in S3 volume |
-| ACH Payments | 80,000 rows | ~1K rows | CSV files in S3 volume |
-| Card Profiles | 10,000 rows | ~500 rows | JSON files in S3 volume |
-| Risk/Dispute/Case/Rule | ~16,000 rows combined | ~500 rows | CSV files in S3 volume |
+A one-time backfill script generates **7 days of historical data** so gold tables have meaningful aggregations when the demo starts. Runs once before the demo, not during.
 
-**Streaming Sources (Kafka):**
+**Batch files are generated as dated subdirectories** in the S3 volume to simulate how partner files would have arrived over the past week. Auto Loader processes them in order on first pipeline run.
 
-| Data Type | Real Volume/Day | Demo Volume | Generation Method |
-|-----------|----------------|-------------|-------------------|
-| Domain Events | TBD | ~5K rows | Kafka producer or file-based simulation |
+| Data Type | Real Volume/Day | Demo Volume/Day | Backfill (7 days) | Format |
+|-----------|----------------|-----------------|-------------------|--------|
+| Users | 10,200,000 | ~100K | ~700K | CSV (full snapshot per day) |
+| Linked Accounts | 6,100,000 | ~60K | ~420K | CSV (full snapshot per day) |
+| Account Balances | 5,000,000 | ~50K | ~350K | CSV (full snapshot per day) |
+| Alerts | 2,000,000 | ~20K | ~140K | CSV (incremental) |
+| Payment Events | 1,400,000 | ~14K | ~98K | CSV (incremental) |
+| Card Payments | 580,000 | ~6K | ~42K | CSV (incremental) |
+| Settled Payments | 420,000 | ~4K | ~28K | CSV (incremental) |
+| Wire Transfers | 350,000 | ~4K | ~28K | CSV (incremental) |
+| Verification Checks | 140,000 | ~1K | ~7K | CSV (incremental) |
+| Portal Activity | 130,000 | ~1K | ~7K | CSV (incremental) |
+| ACH Payments | 80,000 | ~1K | ~7K | CSV (incremental) |
+| Card Profiles | 10,000 | ~500 | ~3.5K | JSON (incremental) |
+| Risk/Dispute/Case/Rule | ~16,000 combined | ~500 | ~3.5K | CSV (incremental) |
 
-Use the `databricks-synthetic-data-generation` AI Dev Kit skill with Faker for realistic data.
+**Streaming backfill:** ~5K domain events per day × 7 days = ~35K events written as JSON files to a simulation volume (or produced to Kafka if available).
+
+**Referential integrity:** Backfill generates a shared pool of entity IDs (user_id, account_id, card_id) first, then all file types reference from that pool. This ensures silver joins actually match across sources.
+
+**Backfill totals: ~1.8M rows across all file types, ~200 MB.**
+
+### 8.2 Phase 2: Live Generator (Continuous During Demo)
+
+A **Databricks job with two tasks** runs continuously during the demo to generate fresh data and prove SLA compliance:
+
+#### Task 1: Batch File Generator (runs every 2 minutes)
+
+A scheduled notebook that generates new partner files and writes them to the S3 volume. Each run creates a small batch of files simulating realistic arrival patterns:
+
+| Data Type | Rows per Run (every 2 min) | Files per Run | Notes |
+|-----------|---------------------------|---------------|-------|
+| Alerts | ~28 | 1 | Incremental |
+| Payment Events | ~20 | 1 | Incremental |
+| Card Payments | ~8 | 1 | Incremental |
+| ACH Payments | ~2 | 1 | Incremental |
+| Wire Transfers | ~5 | 1 | Incremental |
+| Settled Payments | ~6 | 1 | Incremental |
+
+Full-snapshot files (users, balances, linked accounts) are **not regenerated** during live demo — they arrive daily, so backfill covers them. Only incremental file types get new files during the demo.
+
+#### Task 2: Streaming Event Producer (runs continuously)
+
+A long-running notebook that produces domain events to Kafka (or writes JSON files to a simulation volume as fallback):
+
+| Setting | Value |
+|---------|-------|
+| **Event rate** | ~3-5 events/second |
+| **Event types** | `payment.created`, `payment.settled`, `account.updated`, `card.activated`, `alert.triggered` |
+| **Entity references** | Draws from the same ID pool as backfill for join consistency |
+| **Timestamp** | `event_ts` = `current_timestamp()` at generation time — used to measure end-to-end latency |
+
+#### SLA Measurement
+
+Latency is measured by comparing timestamps at generation vs. arrival at gold:
+
+| Path | Measurement | Target |
+|------|-------------|--------|
+| **Streaming** | `event_ts` (generated) → `gold` table refresh timestamp | < 5 minutes |
+| **Batch** | File write timestamp in volume → `_ingested_at` in pre-bronze → `gold` refresh | < 15 minutes |
+
+The pipeline should run in **continuous mode** (or triggered every 1-2 minutes) to meet the streaming SLA. Batch SLA is met as long as Auto Loader picks up files within a few pipeline trigger intervals.
+
+### 8.3 Implementation
+
+| Component | Implementation | Notes |
+|-----------|---------------|-------|
+| **Backfill script** | Python notebook using Faker + Spark | Use `databricks-synthetic-data-generation` AI Dev Kit skill |
+| **Live batch generator** | Python notebook, scheduled as Databricks Job (every 2 min) | Writes CSV/JSON files to S3 volume |
+| **Live stream producer** | Python notebook, long-running Databricks Job task | Kafka producer or file-based fallback |
+| **Shared ID pool** | Generated once during backfill, stored as Delta table in `mom_prebronze` | `_entity_ids` table with `user_id`, `account_id`, `card_id` pools |
+| **Pipeline mode** | Continuous or triggered (1-2 min interval) | Required to meet 5-min streaming SLA |
+
+### 8.4 Data Relationships
+
+To ensure silver joins work correctly, all generators share a common entity graph:
+
+```
+users (10K unique) ──┬── linked_accounts (1-3 per user)
+                     ├── account_balances (1 per linked account)
+                     ├── cards (0-2 per user) ──── card_payments, wire_transfers
+                     ├── alerts (random)
+                     └── verification_checks (random)
+
+Domain events reference: user_id, account_id, card_id from the same pools
+Payment files reference: account_id, card_id from the same pools
+```
+
+This entity graph is generated once during backfill Phase 1 and reused by the live generator in Phase 2.
 
 ---
 
