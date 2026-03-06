@@ -21,10 +21,11 @@ This addresses common pain points in fintech data architectures:
 ## 2. Demo Scope
 
 ### In Scope
-- Streaming ingestion from a message bus (Kafka) via SDP streaming tables (Bronze)
-- Batch ingestion from external S3 volume via Auto Loader / `read_files()` (Bronze)
-- Silver layer: 3NF normalized tables with batch-stream join (unified view)
-- Gold layer: Denormalized aggregation tables and metric views for analytics
+- Pre-Bronze: Append-only raw ingestion from Kafka (streaming) and S3 volume (batch Auto Loader)
+- Bronze: Merge/upsert to current state — deduplicated, one clean table per source
+- Silver: 3NF normalized tables with static-stream join (batch bronze + streaming pre-bronze unified)
+- Gold: Denormalized aggregation tables and metric views for analytics
+- Genie Space for natural language querying of gold layer
 - Full pipeline orchestrated as a single SDP pipeline with medallion architecture
 
 ### Out of Scope
@@ -45,22 +46,16 @@ This addresses common pain points in fintech data architectures:
 │   Domain service events  │     │   20+ file types, ~1K        │
 │   from microservices     │     │   files/day, ~4 GB/day,      │
 │   — volumes TBD          │     │   ~30M rows/day total        │
-│                          │     │                              │
-│                          │     │   Key files:                 │
-│                          │     │   - Users (~10M rows/day)    │
-│                          │     │   - Linked Accounts (~6M)    │
-│                          │     │   - Balances (~5M)           │
-│                          │     │   - Alerts (~2M)             │
-│                          │     │   - Payment Events (~1.5M)   │
-│                          │     │   - Transactions (~1.5M      │
-│                          │     │     across 4 types)          │
-│                          │     │   - + 14 smaller file types  │
 └────────┬─────────────────┘     └────────┬─────────────────────┘
          │ streaming                       │ batch (Auto Loader)
          ▼                                 ▼
 ┌──────────────────────────────────────────────────────────┐
-│              BRONZE LAYER (Raw)                          │
-│  waggoner.mom_bronze                                     │
+│          PRE-BRONZE LAYER (Raw / Append-Only)            │
+│  waggoner.mom_prebronze                                  │
+│                                                          │
+│  Immutable audit trail. Every file and event lands here  │
+│  as-is. No dedup, no merge. Metadata columns added.     │
+│                                                          │
 │  ┌─────────────────────┐  ┌────────────────────────────┐ │
 │  │ Streaming (Kafka)   │  │ Batch (Auto Loader/S3)     │ │
 │  │ - domain_events     │  │ - users                    │ │
@@ -79,28 +74,62 @@ This addresses common pain points in fintech data architectures:
 │  │                     │  │ - case_management          │ │
 │  │                     │  │ - rule_performance         │ │
 │  └─────────────────────┘  └────────────────────────────┘ │
-│  Append-only, metadata columns (_ingested_at,            │
-│  _source_file, _source_type: batch|stream)               │
 └─────────────────────────────┬────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────┐
-│              SILVER LAYER (3NF)                          │
+│          BRONZE LAYER (Merged / Current State)           │
+│  waggoner.mom_bronze                                     │
+│                                                          │
+│  Merge/upsert from pre-bronze. Deduplicates full         │
+│  snapshots, applies SCD Type 1. One clean current-state  │
+│  table per source. Batch sources are static tables;      │
+│  streaming stays as streaming table.                     │
+│                                                          │
+│  ┌─────────────────────┐  ┌────────────────────────────┐ │
+│  │ Streaming           │  │ Merged (from batch)        │ │
+│  │ - domain_events     │  │ - users                    │ │
+│  │   (pass-through)    │  │ - linked_accounts          │ │
+│  │                     │  │ - account_balances         │ │
+│  │                     │  │ - alerts                   │ │
+│  │                     │  │ - payment_events           │ │
+│  │                     │  │ - wire_transfers           │ │
+│  │                     │  │ - card_payments            │ │
+│  │                     │  │ - ach_payments             │ │
+│  │                     │  │ - settled_payments         │ │
+│  │                     │  │ - card_profiles            │ │
+│  │                     │  │ - verification_checks      │ │
+│  │                     │  │ - portal_activity          │ │
+│  │                     │  │ - risk_operations          │ │
+│  │                     │  │ - case_management          │ │
+│  │                     │  │ - rule_performance         │ │
+│  └─────────────────────┘  └────────────────────────────┘ │
+└─────────────────────────────┬────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────┐
+│              SILVER LAYER (3NF / Conformed)              │
 │  waggoner.mom_silver                                     │
+│                                                          │
+│  3NF normalized entity tables. Cross-source joins,       │
+│  static-stream joins (merged bronze batch + streaming    │
+│  domain events), data conforming, business typing.       │
+│                                                          │
 │  ┌────────────────────────────────────────────────────┐  │
-│  │ Normalized entity tables (3NF):                    │  │
-│  │ - users             (SCD Type 2, from users)       │  │
-│  │ - accounts          (SCD Type 2, balances+linked)  │  │
-│  │ - transactions      (batch+stream join, 4 payment  │  │
-│  │                      types unified)                │  │
-│  │ - cards             (card profiles + payment events)│  │
-│  │ - alerts            (alerts + payment events)      │  │
-│  │ - verifications     (verification checks + logins) │  │
-│  │ - portal_activity   (portal usage + searches)      │  │
-│  │ - risk_operations   (disputes + cases + rules)     │  │
+│  │ AUTO CDC (SCD Type 2) — single-source entities:   │  │
+│  │ - users             (history tracked)              │  │
+│  │ - cards             (history tracked)              │  │
+│  │                                                    │  │
+│  │ Materialized Views — multi-source joins:           │  │
+│  │ - accounts          (join: balances + linked)      │  │
+│  │ - transactions      (static-stream join: 4 merged  │  │
+│  │                      payment types + domain_events)│  │
+│  │ - cards_enriched    (join: profiles + pay events)  │  │
+│  │ - alerts            (join: alerts + pay events)    │  │
+│  │ - verifications     (join: checks + logins)        │  │
+│  │ - portal_activity   (join: usage + searches)       │  │
+│  │ - risk_operations   (join: disputes+cases+rules)   │  │
 │  └────────────────────────────────────────────────────┘  │
-│  Cleaned, validated, deduplicated, typed.                │
-│  Batch + stream unified via upsert/merge.                │
 └─────────────────────────────┬────────────────────────────┘
                               │
                               ▼
@@ -133,20 +162,21 @@ This addresses common pain points in fintech data architectures:
 |---------|-------|
 | **Workspace** | `e2-demo-field-eng.cloud.databricks.com` (profile: `e2-field`) |
 | **Catalog** | `waggoner` (existing) |
+| **Pre-Bronze Schema** | `mom_prebronze` |
 | **Bronze Schema** | `mom_bronze` |
 | **Silver Schema** | `mom_silver` |
 | **Gold Schema** | `mom_gold` |
-| **Volume (batch source)** | `/Volumes/waggoner/mom_bronze/partner_files/` |
-| **Schema Metadata Volume** | `/Volumes/waggoner/mom_bronze/pipeline_metadata/schemas` |
+| **Volume (batch source)** | `/Volumes/waggoner/mom_prebronze/partner_files/` |
+| **Schema Metadata Volume** | `/Volumes/waggoner/mom_prebronze/pipeline_metadata/schemas` |
 | **Compute** | Serverless (SDP default) |
 
 ---
 
 ## 5. Data Model
 
-### 5.1 Bronze Layer — Raw Ingestion
+### 5.1 Pre-Bronze Layer — Raw / Append-Only Ingestion
 
-All bronze tables are **streaming tables** with append-only semantics.
+All pre-bronze tables are **streaming tables** with append-only semantics. This layer is the **immutable audit trail** — every file delivery and every streaming event is preserved exactly as received. No deduplication, no merge, no transformation beyond metadata enrichment.
 
 #### Streaming Sources (Kafka)
 
@@ -154,7 +184,7 @@ These represent domain service events published from upstream microservices. Vol
 
 | Table | Source Topic | Key Fields | Notes |
 |-------|-------------|------------|-------|
-| `bronze_domain_events` | `finserv.domain_events` | `event_id`, `entity_type`, `entity_id`, `event_ts` | Domain service CDC events; volumes TBD |
+| `prebronze_domain_events` | `finserv.domain_events` | `event_id`, `entity_type`, `entity_id`, `event_ts` | Domain service CDC events; volumes TBD |
 
 #### Batch Sources (Auto Loader from S3 Volume — Partner Data Files)
 
@@ -164,60 +194,106 @@ All file types below arrive as partner data files via a file ingestion framework
 
 | Table | Source Path | Format | Key Fields | Rows/Day | MB/Day | Files/Day |
 |-------|-------------|--------|------------|----------|--------|-----------|
-| `bronze_users` | `.../users/` | CSV | `user_id`, `full_name`, `email`, `signup_date` | 10,200,000 | 1,200 | 1 (full snapshot) |
-| `bronze_linked_accounts` | `.../linked_accounts/` | CSV | `linked_acct_id`, `user_id`, `institution_name` | 6,100,000 | 400 | 1 (full snapshot) |
-| `bronze_account_balances` | `.../account_balances/` | CSV | `account_id`, `balance`, `as_of_date` | 5,000,000 | 380 | 1 (full snapshot) |
-| `bronze_alerts` | `.../alerts/` | CSV | `alert_id`, `user_id`, `alert_type`, `created_at` | 2,000,000 | 150 | 200 |
-| `bronze_payment_events` | `.../payment_events/` | CSV | `event_id`, `card_id`, `event_type`, `event_ts` | 1,400,000 | 400 | 200 |
-| `bronze_card_payments` | `.../card_payments/` | CSV | `payment_id`, `card_id`, `amount`, `payment_date` | 580,000 | 85 | 2 |
-| `bronze_settled_payments` | `.../settled_payments/` | CSV | `payment_id`, `account_id`, `amount`, `settle_date` | 420,000 | 50 | 1 |
-| `bronze_wire_transfers` | `.../wire_transfers/` | CSV | `transfer_id`, `card_id`, `recipient`, `amount`, `transfer_date` | 350,000 | 320 | 3 |
-| `bronze_verification_checks` | `.../verification_checks/` | CSV | `check_id`, `user_id`, `check_type`, `result` | 140,000 | 40 | 50 |
-| `bronze_portal_activity` | `.../portal_activity/` | CSV | `session_id`, `user_id`, `action`, `timestamp` | 130,000 | 2 | 96 |
-| `bronze_ach_payments` | `.../ach_payments/` | CSV | `payment_id`, `account_id`, `amount`, `payment_date` | 80,000 | 8 | 24 |
+| `prebronze_users` | `.../users/` | CSV | `user_id`, `full_name`, `email`, `signup_date` | 10,200,000 | 1,200 | 1 (full snapshot) |
+| `prebronze_linked_accounts` | `.../linked_accounts/` | CSV | `linked_acct_id`, `user_id`, `institution_name` | 6,100,000 | 400 | 1 (full snapshot) |
+| `prebronze_account_balances` | `.../account_balances/` | CSV | `account_id`, `balance`, `as_of_date` | 5,000,000 | 380 | 1 (full snapshot) |
+| `prebronze_alerts` | `.../alerts/` | CSV | `alert_id`, `user_id`, `alert_type`, `created_at` | 2,000,000 | 150 | 200 |
+| `prebronze_payment_events` | `.../payment_events/` | CSV | `event_id`, `card_id`, `event_type`, `event_ts` | 1,400,000 | 400 | 200 |
+| `prebronze_card_payments` | `.../card_payments/` | CSV | `payment_id`, `card_id`, `amount`, `payment_date` | 580,000 | 85 | 2 |
+| `prebronze_settled_payments` | `.../settled_payments/` | CSV | `payment_id`, `account_id`, `amount`, `settle_date` | 420,000 | 50 | 1 |
+| `prebronze_wire_transfers` | `.../wire_transfers/` | CSV | `transfer_id`, `card_id`, `recipient`, `amount`, `transfer_date` | 350,000 | 320 | 3 |
+| `prebronze_verification_checks` | `.../verification_checks/` | CSV | `check_id`, `user_id`, `check_type`, `result` | 140,000 | 40 | 50 |
+| `prebronze_portal_activity` | `.../portal_activity/` | CSV | `session_id`, `user_id`, `action`, `timestamp` | 130,000 | 2 | 96 |
+| `prebronze_ach_payments` | `.../ach_payments/` | CSV | `payment_id`, `account_id`, `amount`, `payment_date` | 80,000 | 8 | 24 |
 
 **Low-Volume Files (<100K rows/day):**
 
 | Table | Source Path | Format | Key Fields | Rows/Day | Files/Day |
 |-------|-------------|--------|------------|----------|-----------|
-| `bronze_card_profiles` | `.../card_profiles/` | JSON | `card_id`, `account_id`, `card_type`, `status` | 10,000 | 24 |
-| `bronze_risk_operations` | `.../risk_ops/` | CSV | `op_id`, `card_id`, `op_type`, `op_date` | 9,000 | 1 |
-| `bronze_rule_performance` | `.../rule_performance/` | CSV | `rule_id`, `accounts_affected`, `false_positive_rate` | 6,000 | 1 |
-| `bronze_portal_logins` | `.../portal_logins/` | CSV | `user_id`, `login_ts`, `ip_address` | 1,000 | 96 |
-| `bronze_portal_searches` | `.../portal_searches/` | CSV | `user_id`, `search_term`, `search_ts` | 1,200 | 96 |
-| `bronze_dispute_records` | `.../disputes/` | CSV | `dispute_id`, `account_id`, `amount`, `status` | 1,000 | 1 |
-| `bronze_verification_logins` | `.../verification_logins/` | CSV | `user_id`, `login_ts`, `status` | 600 | 50 |
-| `bronze_dispute_status_changes` | `.../dispute_status/` | CSV | `dispute_id`, `old_status`, `new_status`, `change_ts` | 300 | 1 |
-| `bronze_portal_users` | `.../portal_users/` | CSV | `user_id`, `role`, `status` | 20 | 96 |
-| `bronze_rule_summaries` | `.../rule_summaries/` | CSV | `rule_id`, `summary_date`, `hit_count` | 10 | 1 |
-| `bronze_case_records` | `.../cases/` | CSV | `case_id`, `case_type`, `status`, `outcome` | ~5 (combined) | <1 |
+| `prebronze_card_profiles` | `.../card_profiles/` | JSON | `card_id`, `account_id`, `card_type`, `status` | 10,000 | 24 |
+| `prebronze_risk_operations` | `.../risk_ops/` | CSV | `op_id`, `card_id`, `op_type`, `op_date` | 9,000 | 1 |
+| `prebronze_rule_performance` | `.../rule_performance/` | CSV | `rule_id`, `accounts_affected`, `false_positive_rate` | 6,000 | 1 |
+| `prebronze_portal_logins` | `.../portal_logins/` | CSV | `user_id`, `login_ts`, `ip_address` | 1,000 | 96 |
+| `prebronze_portal_searches` | `.../portal_searches/` | CSV | `user_id`, `search_term`, `search_ts` | 1,200 | 96 |
+| `prebronze_dispute_records` | `.../disputes/` | CSV | `dispute_id`, `account_id`, `amount`, `status` | 1,000 | 1 |
+| `prebronze_verification_logins` | `.../verification_logins/` | CSV | `user_id`, `login_ts`, `status` | 600 | 50 |
+| `prebronze_dispute_status_changes` | `.../dispute_status/` | CSV | `dispute_id`, `old_status`, `new_status`, `change_ts` | 300 | 1 |
+| `prebronze_portal_users` | `.../portal_users/` | CSV | `user_id`, `role`, `status` | 20 | 96 |
+| `prebronze_rule_summaries` | `.../rule_summaries/` | CSV | `rule_id`, `summary_date`, `hit_count` | 10 | 1 |
+| `prebronze_case_records` | `.../cases/` | CSV | `case_id`, `case_type`, `status`, `outcome` | ~5 (combined) | <1 |
 
 **Totals: ~26.5M rows/day, ~3.1 GB/day, ~850 files/day across 22 file types.**
 **2-Year Backfill Estimate: ~19B rows, ~2.3 TB, ~620K files.**
 
-All bronze tables include metadata columns:
+All pre-bronze tables include metadata columns:
 - `_ingested_at` — `current_timestamp()`
 - `_source_file` — `_metadata.file_path` (batch) or `NULL` (stream)
 - `_source_type` — `'batch'` or `'stream'`
 
-### 5.2 Silver Layer — Normalized (3NF)
+### 5.2 Bronze Layer — Merged / Current State
 
-Silver tables are **streaming tables with AUTO CDC** for deduplication and SCD tracking. This is the key layer where batch and streaming data are unified.
+Bronze reads from pre-bronze and applies **AUTO CDC (SCD Type 1)** to merge changes into current-state tables. Full-snapshot files (users, linked accounts, balances) are deduplicated here — no duplicate rows propagate downstream. Incremental files are merged on their natural key.
 
-| Table | Sources | Join Logic | SCD | Key Columns |
-|-------|---------|------------|-----|-------------|
-| `silver_users` | `bronze_users` | Deduplicate on `user_id` | Type 2 | `user_id`, `full_name`, `email`, `status` |
-| `silver_accounts` | `bronze_account_balances`, `bronze_linked_accounts` | Join on `account_id` / `user_id` | Type 2 | `account_id`, `user_id`, `balance`, `institution_name` |
-| `silver_transactions` | `bronze_ach_payments` + `bronze_wire_transfers` + `bronze_card_payments` + `bronze_settled_payments` + `bronze_domain_events` (stream) | **Batch+Stream Join**: Unify 4 batch payment types (~1.4M rows/day combined) with streaming domain events. Enrich with card metadata via `card_id` join to `silver_cards`. | Type 1 | `payment_id`, `account_id`, `card_id`, `amount`, `payment_type`, `card_type` |
-| `silver_cards` | `bronze_card_profiles`, `bronze_payment_events` | Join card master (~10K/day) with payment events (~1.4M/day) on `card_id` | Type 2 | `card_id`, `account_id`, `card_type`, `status`, `last_event` |
-| `silver_alerts` | `bronze_alerts`, `bronze_payment_events` | Union alerts (~2M/day) and payment events (~1.4M/day), deduplicate | Type 1 | `alert_id`, `user_id`, `alert_type`, `channel`, `created_at` |
-| `silver_verifications` | `bronze_verification_checks`, `bronze_verification_logins` | Join verification checks (~140K/day) with login activity (~600/day) on `user_id` | Type 2 | `user_id`, `check_type`, `result`, `last_login_ts` |
-| `silver_portal_activity` | `bronze_portal_activity`, `bronze_portal_logins`, `bronze_portal_searches`, `bronze_portal_users` | Union portal activity streams, join with portal users on `user_id` | Type 1 | `activity_id`, `user_id`, `activity_type`, `timestamp` |
-| `silver_risk_operations` | `bronze_dispute_records`, `bronze_dispute_status_changes`, `bronze_case_records`, `bronze_rule_performance`, `bronze_rule_summaries`, `bronze_risk_operations` | Union dispute/case/rule sources into normalized risk operations entity | Type 1 | `operation_id`, `operation_type`, `account_id`, `status`, `created_at` |
+The streaming source (`domain_events`) passes through as a streaming table since events are inherently append-only and don't need merge.
 
-**Critical demo point — `silver_transactions`:** This table demonstrates the unified batch+stream join. Four separate batch payment file types (ACH: ~80K/day, Wire: ~350K/day, Card: ~580K/day, Settled: ~420K/day = **~1.4M total/day**) are unified with streaming domain events into a single transactions table. This eliminates the common pattern of maintaining separate batch and stream paths with manual reconciliation.
+| Table | Source | Merge Key | Merge Strategy | Notes |
+|-------|--------|-----------|----------------|-------|
+| `bronze_users` | `prebronze_users` | `user_id` | SCD Type 1 (upsert) | Full daily snapshot → merged to current state |
+| `bronze_linked_accounts` | `prebronze_linked_accounts` | `linked_acct_id` | SCD Type 1 (upsert) | Full daily snapshot → merged to current state |
+| `bronze_account_balances` | `prebronze_account_balances` | `account_id` | SCD Type 1 (upsert) | Full daily snapshot → merged to current state |
+| `bronze_alerts` | `prebronze_alerts` | `alert_id` | SCD Type 1 (upsert) | Incremental files, dedup on key |
+| `bronze_payment_events` | `prebronze_payment_events` | `event_id` | SCD Type 1 (upsert) | Incremental files, dedup on key |
+| `bronze_card_payments` | `prebronze_card_payments` | `payment_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_settled_payments` | `prebronze_settled_payments` | `payment_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_wire_transfers` | `prebronze_wire_transfers` | `transfer_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_ach_payments` | `prebronze_ach_payments` | `payment_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_card_profiles` | `prebronze_card_profiles` | `card_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_verification_checks` | `prebronze_verification_checks` | `check_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_portal_activity` | `prebronze_portal_activity` | `session_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_portal_logins` | `prebronze_portal_logins` | `user_id`, `login_ts` | SCD Type 1 (upsert) | Incremental |
+| `bronze_portal_searches` | `prebronze_portal_searches` | `user_id`, `search_ts` | SCD Type 1 (upsert) | Incremental |
+| `bronze_portal_users` | `prebronze_portal_users` | `user_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_risk_operations` | `prebronze_risk_operations` | `op_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_rule_performance` | `prebronze_rule_performance` | `rule_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_rule_summaries` | `prebronze_rule_summaries` | `rule_id`, `summary_date` | SCD Type 1 (upsert) | Incremental |
+| `bronze_dispute_records` | `prebronze_dispute_records` | `dispute_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_dispute_status_changes` | `prebronze_dispute_status_changes` | `dispute_id`, `change_ts` | SCD Type 1 (upsert) | Incremental |
+| `bronze_case_records` | `prebronze_case_records` | `case_id` | SCD Type 1 (upsert) | Incremental |
+| `bronze_domain_events` | `prebronze_domain_events` | — | Streaming pass-through | No merge needed; events are append-only |
 
-### 5.3 Gold Layer — Denormalized + Aggregations
+### 5.3 Silver Layer — 3NF / Conformed
+
+Silver reads from bronze (merged current-state tables) and builds **3NF normalized entity tables**. This is where cross-source joins happen, data is conformed to standard business types, and the **static-stream join** unifies batch and streaming data.
+
+Silver tables read from bronze batch tables as **static DataFrames** (already merged/current) and join with the streaming `bronze_domain_events` table. This is the classic Spark static-stream join pattern.
+
+Silver tables fall into two categories based on how many bronze sources they read from:
+
+**Single-source entity tables** use **AUTO CDC with SCD Type 2** to track history. AUTO CDC watches one source table for changes and automatically maintains versioned rows with `__START_AT` and `__END_AT` timestamps. This works well when there's a 1:1 relationship between a bronze table and a silver entity.
+
+**Multi-source joined tables** use **materialized views** instead. AUTO CDC requires a single streaming source — it can't natively watch multiple tables for changes and figure out which side triggered an update. A materialized view solves this by recomputing the full joined result whenever any source table changes, so it always reflects the correct current state without needing to wire up change-tracking across multiple inputs.
+
+| Table | Sources | Type | Logic | Key Columns |
+|-------|---------|------|-------|-------------|
+| `silver_users` | `bronze_users` | **AUTO CDC (SCD2)** | Single source. Conform types, validate email, standardize status codes. History tracked. | `user_id`, `full_name`, `email`, `status` |
+| `silver_cards` | `bronze_card_profiles` | **AUTO CDC (SCD2)** | Single source. Conform card types. History tracked. | `card_id`, `account_id`, `card_type`, `status` |
+| `silver_accounts` | `bronze_account_balances` + `bronze_linked_accounts` | **Materialized View** | Multi-source join on `account_id` / `user_id`. Conform institution names, standardize balance types. Recomputes on refresh. | `account_id`, `user_id`, `balance`, `institution_name` |
+| `silver_transactions` | `bronze_ach_payments` + `bronze_wire_transfers` + `bronze_card_payments` + `bronze_settled_payments` (static) + `bronze_domain_events` (stream) | **Materialized View** | Multi-source. Union 4 merged payment tables (~1.4M rows/day), static-stream join with domain events, enrich with card metadata. Add conformed `payment_type`. | `payment_id`, `account_id`, `card_id`, `amount`, `payment_type`, `card_type` |
+| `silver_cards_enriched` | `bronze_card_profiles` + `bronze_payment_events` | **Materialized View** | Multi-source join of card master with payment events on `card_id`. Last event timestamp derived. | `card_id`, `account_id`, `card_type`, `status`, `last_event` |
+| `silver_alerts` | `bronze_alerts` + `bronze_payment_events` | **Materialized View** | Multi-source. Union and deduplicate. Conform alert types to standard taxonomy. | `alert_id`, `user_id`, `alert_type`, `channel`, `created_at` |
+| `silver_verifications` | `bronze_verification_checks` + `bronze_verification_logins` | **Materialized View** | Multi-source join of checks with logins on `user_id`. Standardize check result codes. | `user_id`, `check_type`, `result`, `last_login_ts` |
+| `silver_portal_activity` | `bronze_portal_activity` + `bronze_portal_logins` + `bronze_portal_searches` + `bronze_portal_users` | **Materialized View** | Multi-source. Union activity streams, join with portal users on `user_id`. Conform activity types. | `activity_id`, `user_id`, `activity_type`, `timestamp` |
+| `silver_risk_operations` | `bronze_dispute_records` + `bronze_dispute_status_changes` + `bronze_case_records` + `bronze_rule_performance` + `bronze_rule_summaries` + `bronze_risk_operations` | **Materialized View** | Multi-source. Union all risk sources into normalized entity. Conform operation types and status codes. | `operation_id`, `operation_type`, `account_id`, `status`, `created_at` |
+
+**Why this split matters:**
+- **AUTO CDC (SCD2)** is ideal when you have one source feeding one entity — it incrementally processes only the changed rows and automatically maintains history versions. It's efficient and tracks exactly when each field changed.
+- **Materialized views** are the right tool when combining multiple sources — they recompute the full result set on each refresh, which means changes from *any* source table are reflected without complex change-detection logic. The tradeoff is that materialized views don't track row-level history (no `__START_AT`/`__END_AT`), but the individual source entities that need history (users, cards) already have it via their own SCD2 tables.
+
+**Point-in-time analysis:** If an analyst needs to answer "what did this account look like on March 1st?", they can query `silver_users` (SCD2, has history) directly. For joined entities like accounts, the current state is always available in the materialized view, and historical state can be reconstructed by joining `silver_users` history with the relevant bronze tables at a point in time.
+
+**Critical demo point — `silver_transactions`:** This table demonstrates the **static-stream join**. The 4 payment type tables in bronze are already merged to current state (static), and are joined with the streaming `domain_events` table. This pattern — static batch data joined with a live stream — is the core of the unified ingestion design, eliminating the need for separate batch and stream processing paths.
+
+### 5.4 Gold Layer — Denormalized + Aggregations
 
 Gold tables use **materialized views** for aggregations and **AUTO CDC** for denormalized dimension tables.
 
@@ -230,21 +306,27 @@ Gold tables use **materialized views** for aggregations and **AUTO CDC** for den
 | `gold_fact_risk_operations` | `silver_risk_operations` + `silver_transactions` | `operation_date`, `operation_type` | `dispute_count`, `total_disputed_amount`, `avg_resolution_days`, `false_positive_rate` |
 | `gold_agg_risk_summary` | `silver_transactions` + `silver_cards` + `silver_risk_operations` | `payment_date`, `card_type` | `high_value_txn_count`, `distinct_accounts`, `total_flagged_amount` |
 
-#### Dimension Tables (AUTO CDC → SCD Type 2)
+#### Dimension Tables (Materialized Views from Silver SCD2)
 
-| Table | Source | Key | Tracked Columns |
-|-------|--------|-----|-----------------|
-| `gold_dim_users` | `silver_users` | `user_id` | `full_name`, `email`, `status` |
-| `gold_dim_accounts` | `silver_accounts` | `account_id` | `balance`, `institution_name`, `status` |
-| `gold_dim_cards` | `silver_cards` | `card_id` | `card_type`, `status`, `last_event` |
+Gold dimension tables are **materialized views** that expose current state for dashboards and Genie. For silver SCD Type 2 sources (`silver_users`, `silver_cards`), they filter `WHERE __END_AT IS NULL` — full history remains queryable in silver for point-in-time analysis. For silver materialized view sources (`silver_accounts`), the data is already current state.
 
-#### Metric Views
+| Table | Source | Key | Columns |
+|-------|--------|-----|---------|
+| `gold_dim_users` | `silver_users` (SCD2, `WHERE __END_AT IS NULL`) | `user_id` | `full_name`, `email`, `status` |
+| `gold_dim_accounts` | `silver_accounts` (materialized view, already current state) | `account_id` | `balance`, `institution_name`, `status` |
+| `gold_dim_cards` | `silver_cards` (SCD2, `WHERE __END_AT IS NULL`) | `card_id` | `card_type`, `status` |
 
-| Metric View | Source Table | Dimensions | Measures |
-|-------------|-------------|------------|----------|
-| `gold_mv_transaction_kpis` | `gold_fact_daily_transactions` | `Payment Date`, `Payment Type`, `Account ID` | `Total Transactions`, `Total Volume`, `Avg Transaction Value`, `Volume per Account` |
-| `gold_mv_user_health` | `gold_fact_user_activity` | `Activity Month`, `User Segment` | `Active Users`, `Avg Spend per User`, `Churn Risk Count` |
-| `gold_mv_risk_operations` | `gold_fact_risk_operations` | `Operation Month`, `Operation Type` | `Total Disputes`, `Total Disputed Amount`, `Avg Resolution Days`, `False Positive Rate` |
+#### Materialized Metric Views
+
+Metric views are **materialized** to pre-compute aggregations for fast query performance. Databricks automatically creates a managed Lakeflow SDP pipeline that refreshes the materializations on schedule. At query time, aggregate-aware query rewriting routes queries to the pre-computed views (fast path) or falls back to source data when materializations aren't available.
+
+Each metric view specifies a `materialization` block in its YAML definition with a refresh schedule, mode (`relaxed`), and one or more materialized views (either `aggregated` for specific measure-dimension combos, or `unaggregated` for full data model coverage).
+
+| Metric View | Source Table | Dimensions | Measures | Materialization Type |
+|-------------|-------------|------------|----------|---------------------|
+| `gold_mv_transaction_kpis` | `gold_fact_daily_transactions` | `Payment Date`, `Payment Type`, `Account ID` | `Total Transactions`, `Total Volume`, `Avg Transaction Value`, `Volume per Account` | `aggregated` |
+| `gold_mv_user_health` | `gold_fact_user_activity` | `Activity Month`, `User Segment` | `Active Users`, `Avg Spend per User`, `Churn Risk Count` | `aggregated` |
+| `gold_mv_risk_operations` | `gold_fact_risk_operations` | `Operation Month`, `Operation Type` | `Total Disputes`, `Total Disputed Amount`, `Avg Resolution Days`, `False Positive Rate` | `aggregated` |
 
 ---
 
@@ -261,7 +343,7 @@ Gold tables use **materialized views** for aggregations and **AUTO CDC** for den
 | **Ingestion (batch)** | `read_files()` with `STREAM` | Auto Loader pattern via SQL |
 | **Ingestion (stream)** | `read_kafka()` or simulated via files | Kafka integration or file-based simulation |
 | **CDC** | AUTO CDC with SCD Type 1 & 2 | Built-in dedup and history tracking |
-| **Metric Views** | Unity Catalog YAML metric views | Governed KPI definitions |
+| **Metric Views** | Unity Catalog YAML metric views (materialized) | Governed KPI definitions with pre-computed aggregations |
 | **Clustering** | `CLUSTER BY` (Liquid Clustering) | Modern default, not `PARTITION BY` |
 
 ### 6.2 Pipeline Configuration
@@ -275,12 +357,13 @@ resources:
     mom_pipeline:
       name: "mom_medallion_pipeline"
       catalog: "waggoner"
-      schema: "mom_bronze"  # default target = bronze
+      schema: "mom_prebronze"  # default target = pre-bronze
       configuration:
+        bronze_schema: "mom_bronze"
         silver_schema: "mom_silver"
         gold_schema: "mom_gold"
-        source_volume: "/Volumes/waggoner/mom_bronze/partner_files"
-        schema_location_base: "/Volumes/waggoner/mom_bronze/pipeline_metadata/schemas"
+        source_volume: "/Volumes/waggoner/mom_prebronze/partner_files"
+        schema_location_base: "/Volumes/waggoner/mom_prebronze/pipeline_metadata/schemas"
 ```
 
 ### 6.3 File Structure
@@ -294,36 +377,60 @@ batch-stream-medallion/
 └── src/
     └── mom_pipeline/
         └── transformations/
+            ├── prebronze/
+            │   ├── prebronze_domain_events.sql           # Kafka streaming
+            │   ├── prebronze_users.sql                    # Auto Loader batch (10.2M/day)
+            │   ├── prebronze_linked_accounts.sql          # Auto Loader batch (6.1M/day)
+            │   ├── prebronze_account_balances.sql         # Auto Loader batch (5M/day)
+            │   ├── prebronze_alerts.sql                   # Auto Loader batch (2M/day)
+            │   ├── prebronze_payment_events.sql           # Auto Loader batch (1.4M/day)
+            │   ├── prebronze_card_payments.sql            # Auto Loader batch (580K/day)
+            │   ├── prebronze_settled_payments.sql         # Auto Loader batch (420K/day)
+            │   ├── prebronze_wire_transfers.sql           # Auto Loader batch (350K/day)
+            │   ├── prebronze_verification_checks.sql      # Auto Loader batch (140K/day)
+            │   ├── prebronze_portal_activity.sql          # Auto Loader batch (130K/day)
+            │   ├── prebronze_ach_payments.sql             # Auto Loader batch (80K/day)
+            │   ├── prebronze_card_profiles.sql            # Auto Loader batch (10K/day)
+            │   ├── prebronze_risk_operations.sql          # Auto Loader batch (9K/day)
+            │   ├── prebronze_rule_performance.sql         # Auto Loader batch (6K/day)
+            │   ├── prebronze_disputes.sql                 # Auto Loader batch (disputes + status)
+            │   ├── prebronze_portal_users_logins.sql      # Auto Loader batch (logins, searches, users)
+            │   ├── prebronze_verification_logins.sql      # Auto Loader batch (600/day)
+            │   ├── prebronze_rule_summaries.sql           # Auto Loader batch (10/day)
+            │   └── prebronze_case_records.sql             # Auto Loader batch (<5/day)
             ├── bronze/
-            │   ├── bronze_domain_events.sql           # Kafka streaming
-            │   ├── bronze_users.sql                    # Auto Loader batch (10.2M/day)
-            │   ├── bronze_linked_accounts.sql          # Auto Loader batch (6.1M/day)
-            │   ├── bronze_account_balances.sql         # Auto Loader batch (5M/day)
-            │   ├── bronze_alerts.sql                   # Auto Loader batch (2M/day)
-            │   ├── bronze_payment_events.sql           # Auto Loader batch (1.4M/day)
-            │   ├── bronze_card_payments.sql            # Auto Loader batch (580K/day)
-            │   ├── bronze_settled_payments.sql         # Auto Loader batch (420K/day)
-            │   ├── bronze_wire_transfers.sql           # Auto Loader batch (350K/day)
-            │   ├── bronze_verification_checks.sql      # Auto Loader batch (140K/day)
-            │   ├── bronze_portal_activity.sql          # Auto Loader batch (130K/day)
-            │   ├── bronze_ach_payments.sql             # Auto Loader batch (80K/day)
-            │   ├── bronze_card_profiles.sql            # Auto Loader batch (10K/day)
-            │   ├── bronze_risk_operations.sql          # Auto Loader batch (9K/day)
-            │   ├── bronze_rule_performance.sql         # Auto Loader batch (6K/day)
-            │   ├── bronze_disputes.sql                 # Auto Loader batch (disputes + status)
-            │   ├── bronze_portal_users_logins.sql      # Auto Loader batch (logins, searches, users)
-            │   ├── bronze_verification_logins.sql      # Auto Loader batch (600/day)
-            │   ├── bronze_rule_summaries.sql           # Auto Loader batch (10/day)
-            │   └── bronze_case_records.sql             # Auto Loader batch (<5/day)
+            │   ├── bronze_domain_events.sql           # Streaming pass-through
+            │   ├── bronze_users.sql                    # AUTO CDC merge from prebronze
+            │   ├── bronze_linked_accounts.sql          # AUTO CDC merge from prebronze
+            │   ├── bronze_account_balances.sql         # AUTO CDC merge from prebronze
+            │   ├── bronze_alerts.sql                   # AUTO CDC merge from prebronze
+            │   ├── bronze_payment_events.sql           # AUTO CDC merge from prebronze
+            │   ├── bronze_card_payments.sql            # AUTO CDC merge from prebronze
+            │   ├── bronze_settled_payments.sql         # AUTO CDC merge from prebronze
+            │   ├── bronze_wire_transfers.sql           # AUTO CDC merge from prebronze
+            │   ├── bronze_ach_payments.sql             # AUTO CDC merge from prebronze
+            │   ├── bronze_card_profiles.sql            # AUTO CDC merge from prebronze
+            │   ├── bronze_verification_checks.sql      # AUTO CDC merge from prebronze
+            │   ├── bronze_portal_activity.sql          # AUTO CDC merge from prebronze
+            │   ├── bronze_portal_logins.sql            # AUTO CDC merge from prebronze
+            │   ├── bronze_portal_searches.sql          # AUTO CDC merge from prebronze
+            │   ├── bronze_portal_users.sql             # AUTO CDC merge from prebronze
+            │   ├── bronze_risk_operations.sql          # AUTO CDC merge from prebronze
+            │   ├── bronze_rule_performance.sql         # AUTO CDC merge from prebronze
+            │   ├── bronze_rule_summaries.sql           # AUTO CDC merge from prebronze
+            │   ├── bronze_dispute_records.sql          # AUTO CDC merge from prebronze
+            │   ├── bronze_dispute_status_changes.sql   # AUTO CDC merge from prebronze
+            │   └── bronze_case_records.sql             # AUTO CDC merge from prebronze
             ├── silver/
-            │   ├── silver_users.sql                # CDC from users
-            │   ├── silver_accounts.sql             # Join balances + linked accounts
-            │   ├── silver_transactions.sql         # Stream+batch join (4 payment types + domain events)
-            │   ├── silver_cards.sql                # Join card profiles + payment events
-            │   ├── silver_alerts.sql               # Union alerts + payment events
-            │   ├── silver_verifications.sql        # Join checks + logins
-            │   ├── silver_portal_activity.sql      # Union portal activity streams
-            │   └── silver_risk_operations.sql      # Union disputes + cases + rules
+            │   ├── silver_users.sql                # AUTO CDC SCD2 (single source)
+            │   ├── silver_cards.sql                # AUTO CDC SCD2 (single source)
+            │   ├── silver_accounts.sql             # Materialized view (join: balances + linked)
+            │   ├── silver_transactions.sql         # Materialized view (static-stream join)
+            │   ├── silver_cards_enriched.sql       # Materialized view (join: profiles + events)
+            │   ├── silver_alerts.sql               # Materialized view (union: alerts + events)
+            │   ├── silver_verifications.sql        # Materialized view (join: checks + logins)
+            │   ├── silver_portal_activity.sql      # Materialized view (union: portal streams)
+            │   └── silver_risk_operations.sql      # Materialized view (union: disputes+cases+rules)
             └── gold/
                 ├── gold_fact_daily_transactions.sql
                 ├── gold_fact_user_activity.sql
@@ -358,14 +465,18 @@ When building this pipeline with the AI Dev Kit Claude Code plugin, follow these
 - **Modern defaults**: Serverless compute, Unity Catalog, raw `.sql` files (not notebooks)
 
 ### Multi-Schema Pattern
-- Pipeline default catalog/schema = `waggoner.mom_bronze`
-- Silver and gold schemas referenced via pipeline configuration parameters
-- Silver tables use fully-qualified names: `${silver_schema}.silver_users`
-- Gold tables use fully-qualified names: `${gold_schema}.gold_fact_daily_transactions`
+- Pipeline default catalog/schema = `waggoner.mom_prebronze`
+- Bronze, silver, and gold schemas referenced via pipeline configuration parameters
+- Bronze tables use: `${bronze_schema}.bronze_users`
+- Silver tables use: `${silver_schema}.silver_users`
+- Gold tables use: `${gold_schema}.gold_fact_daily_transactions`
 
-### Metric Views
-- Require **Databricks Runtime 17.2+**
+### Metric Views (Materialized)
+- Require **Databricks Runtime 17.2+** and **serverless compute**
 - Define in SQL with `CREATE OR REPLACE VIEW ... WITH METRICS LANGUAGE YAML`
+- Include `materialization` block in YAML: schedule, mode (`relaxed`), and materialized views (`aggregated` or `unaggregated`)
+- Databricks auto-creates a managed SDP pipeline for refreshing materializations
+- Queries automatically route to pre-computed views (fast path) when available
 - All measures must be queried with `MEASURE()` function
 - `SELECT *` is not supported on metric views
 
@@ -373,11 +484,13 @@ When building this pipeline with the AI Dev Kit Claude Code plugin, follow these
 - [ ] Language: SQL
 - [ ] Compute: Serverless
 - [ ] All tables use `CLUSTER BY` (not `PARTITION BY`)
-- [ ] Bronze streaming tables use `FROM STREAM read_files(...)` for batch sources
-- [ ] Silver tables implement AUTO CDC for deduplication
+- [ ] Pre-bronze streaming tables use `FROM STREAM read_files(...)` for batch sources
+- [ ] Bronze tables implement AUTO CDC (SCD Type 1) merge from pre-bronze
+- [ ] Silver tables implement cross-source joins and static-stream join
 - [ ] Gold materialized views reference silver tables correctly
 - [ ] Pipeline parameters defined for cross-schema references
-- [ ] Metric views use version 1.1 YAML spec
+- [ ] Metric views use version 1.1 YAML spec with `materialization` block
+- [ ] Metric view materializations refresh on schedule and queries use fast path
 - [ ] Asset Bundle validates: `databricks bundle validate`
 
 ---
@@ -414,28 +527,65 @@ Use the `databricks-synthetic-data-generation` AI Dev Kit skill with Faker for r
 
 ---
 
-## 9. Demo Talking Points
+## 9. Genie Space — Natural Language Query Interface
 
-1. **Platform Consolidation**: "This single SDP pipeline replaces a multi-system stack — file ingestion framework, message broker, legacy warehouse, and standalone OLAP engine — with one framework, one catalog, one governance model."
+A **Databricks Genie Space** will be created on top of the gold layer to enable non-technical users (analysts, operations staff, business stakeholders) to query transaction, user, and risk data using natural language — no SQL required.
 
-2. **Unified Batch + Stream**: "The `silver_transactions` table joins streaming domain events with batch partner files automatically. No separate reconciliation process needed."
+### Configuration
 
-3. **Near Real-Time**: "Streaming tables process events as they arrive. No hourly batch windows. The silver and gold layers update continuously."
+| Setting | Value |
+|---------|-------|
+| **Genie Space Name** | `MOM Analytics` |
+| **Source Tables** | All `mom_gold` tables and metric views |
+| **Warehouse** | Serverless SQL warehouse |
 
-4. **Governed Metrics**: "Metric views in Unity Catalog ensure everyone uses the same definition of 'Total Volume' or 'Active Users' — across dashboards, Genie, and ad-hoc SQL."
+### Included Tables
 
-5. **Operational Simplicity**: "Serverless compute, no cluster management, built-in lineage and data quality. The pipeline is the entire data platform."
+| Table / View | Purpose | Example Questions |
+|-------------|---------|-------------------|
+| `gold_fact_daily_transactions` | Transaction volume and trends | "What was total payment volume last week?" |
+| `gold_fact_user_activity` | User engagement metrics | "How many active users did we have in February?" |
+| `gold_fact_risk_operations` | Dispute and case tracking | "Show me open disputes by type this month" |
+| `gold_agg_risk_summary` | Risk overview by card type | "Which card types have the most flagged transactions?" |
+| `gold_dim_users` | User lookups | "How many users signed up in the last 30 days?" |
+| `gold_dim_accounts` | Account details | "What's the average account balance by institution?" |
+| `gold_dim_cards` | Card inventory | "How many active cards do we have by card type?" |
+| `gold_mv_transaction_kpis` | Governed transaction KPIs | "What's the average transaction value by payment type?" |
+| `gold_mv_user_health` | User health metrics | "How many users are at churn risk?" |
+| `gold_mv_risk_operations` | Risk operation KPIs | "What's the average dispute resolution time?" |
 
-6. **OLAP Engine Replacement**: "The gold layer with materialized views and Photon-powered SQL warehouses delivers the same low-latency analytics a standalone OLAP engine provides — without a separate system to manage."
+### Instructions for Genie
+
+The Genie Space will include curated instructions to help the model understand domain context:
+
+- **Payment types**: ACH, Wire, Card, Settled — represent different transaction channels
+- **Risk operations**: Include disputes, cases, and rule evaluations
+- **User segments**: Derived from activity patterns in `gold_fact_user_activity`
+- **Metric views**: When a question aligns with a metric view, prefer querying it over the underlying fact table to ensure governed definitions are used
+- **Time context**: Default to the most recent complete month unless a specific date range is provided
+
+### Sample Certified Questions
+
+Pre-configured questions to guide users and validate accuracy:
+
+1. "What was total transaction volume by payment type this month?"
+2. "How many new users signed up in the last 7 days?"
+3. "Show me the top 10 accounts by total spend"
+4. "What's the false positive rate for risk rules this month?"
+5. "How does this week's payment volume compare to last week?"
 
 ---
 
 ## 10. Success Criteria
 
 - [ ] Pipeline deploys and runs successfully on E2 Field workspace
-- [ ] Bronze tables ingest from both Kafka (stream) and S3 volume (batch)
-- [ ] Silver `silver_transactions` demonstrates batch+stream join
+- [ ] Pre-bronze tables ingest from both Kafka (stream) and S3 volume (batch)
+- [ ] Bronze tables merge pre-bronze to current state via AUTO CDC
+- [ ] Silver `silver_transactions` demonstrates static-stream join
 - [ ] Gold aggregation tables refresh correctly from silver
 - [ ] Metric views are queryable with `MEASURE()` syntax
+- [ ] Genie Space created with all gold tables and metric views
+- [ ] Genie Space answers sample certified questions accurately
+- [ ] Source-to-gold latency under 5 minutes for streaming path (near real-time target)
+- [ ] Source-to-gold latency under 15 minutes for batch file path
 - [ ] End-to-end lineage visible in Unity Catalog
-- [ ] Demo can be presented in under 30 minutes
