@@ -1,0 +1,31 @@
+bundle:
+  name: batch-stream-medallion
+
+include:
+  - resources/*.yml
+
+workspace:
+  host: https://e2-demo-field-eng.cloud.databricks.com
+
+targets:
+  dev:
+    mode: development
+    default: true
+    resources:
+      pipelines:
+        mom_pipeline:
+          development: true
+          catalog: waggoner_mom
+          configuration:
+            source_volume: "/Volumes/waggoner_mom/prebronze/partner_files"
+            schema_location_base: "/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas"
+
+  prod:
+    resources:
+      pipelines:
+        mom_pipeline:
+          development: false
+          catalog: waggoner_mom
+          configuration:
+            source_volume: "/Volumes/waggoner_mom/prebronze/partner_files"
+            schema_location_base: "/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas"

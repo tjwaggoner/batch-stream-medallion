@@ -1,0 +1,15 @@
+resources:
+  pipelines:
+    mom_pipeline:
+      name: "mom_medallion_pipeline"
+      catalog: "waggoner_mom"
+      schema: "prebronze"
+      configuration:
+        bronze_schema: "bronze"
+        silver_schema: "silver"
+        gold_schema: "gold"
+        source_volume: "/Volumes/waggoner_mom/prebronze/partner_files"
+        schema_location_base: "/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas"
+      libraries:
+        - file:
+            path: src/mom_pipeline/transformations
