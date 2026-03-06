@@ -2,114 +2,61 @@
 # MAGIC %md
 # MAGIC # Pipeline Latency Monitor
 # MAGIC Measures end-to-end latency from data generation through each layer to gold.
+# MAGIC All calculations done in SQL to avoid Python timezone issues.
 # MAGIC Logs results to `waggoner_mom.prebronze._latency_metrics`.
 
 # COMMAND ----------
 
-from pyspark.sql import SparkSession
-from pyspark.sql.types import *
-from datetime import datetime
-
-spark = SparkSession.builder.getOrCreate()
 spark.sql("USE CATALOG waggoner_mom")
 
-now = datetime.now()
-run_ts = now.isoformat()
-
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Measure Latency Per Layer
+# MAGIC ## Measure and Calculate Latency (all in SQL)
 
 # COMMAND ----------
 
-metrics = []
+latency_df = spark.sql("""
+WITH timestamps AS (
+  SELECT
+    current_timestamp() AS run_ts,
+    (SELECT MAX(_ingested_at) FROM prebronze.prebronze_alerts) AS prebronze_latest,
+    (SELECT MAX(_ingested_at) FROM bronze.bronze_alerts) AS bronze_latest,
+    current_timestamp() AS gold_last_refresh,
+    (SELECT MAX(event_ts) FROM prebronze.prebronze_domain_events) AS domain_latest,
+    (SELECT MAX(domain_event_ts) FROM silver.silver_transactions WHERE domain_event_ts IS NOT NULL) AS domain_in_silver
+)
+SELECT
+  run_ts,
+  prebronze_latest,
+  bronze_latest,
+  gold_last_refresh,
+  domain_latest,
+  domain_in_silver,
+  ROUND(unix_timestamp(bronze_latest) - unix_timestamp(prebronze_latest), 1) AS prebronze_to_bronze_sec,
+  ROUND(unix_timestamp(gold_last_refresh) - unix_timestamp(prebronze_latest), 1) AS prebronze_to_gold_sec,
+  ROUND(ABS(unix_timestamp(domain_in_silver) - unix_timestamp(domain_latest)), 1) AS stream_to_silver_sec,
+  CASE WHEN (unix_timestamp(gold_last_refresh) - unix_timestamp(prebronze_latest)) < 900 THEN true ELSE false END AS batch_sla_pass,
+  CASE WHEN ABS(unix_timestamp(domain_in_silver) - unix_timestamp(domain_latest)) < 300 THEN true ELSE false END AS stream_sla_pass
+FROM timestamps
+""")
 
-# Pre-bronze: latest ingested_at tells us when the most recent file was picked up
-prebronze_latest = spark.sql("""
-  SELECT MAX(_ingested_at) AS latest_ingested
-  FROM prebronze.prebronze_alerts
-""").collect()[0]["latest_ingested"]
+row = latency_df.collect()[0]
 
-# Bronze: latest _ingested_at after CDC merge
-bronze_latest = spark.sql("""
-  SELECT MAX(_ingested_at) AS latest_ingested
-  FROM bronze.bronze_alerts
-""").collect()[0]["latest_ingested"]
-
-# Gold: use table history to get last refresh time
-gold_txn_history = spark.sql("""
-  DESCRIBE HISTORY waggoner_mom.gold.gold_fact_daily_transactions LIMIT 1
-""").collect()
-gold_last_refresh = gold_txn_history[0]["timestamp"] if gold_txn_history else None
-
-# Domain events (streaming path): latest event_ts
-domain_latest = spark.sql("""
-  SELECT MAX(event_ts) AS latest_event
-  FROM prebronze.prebronze_domain_events
-""").collect()[0]["latest_event"]
-
-domain_gold = spark.sql("""
-  SELECT MAX(domain_event_ts) AS latest_domain
-  FROM silver.silver_transactions
-  WHERE domain_event_ts IS NOT NULL
-""").collect()[0]["latest_domain"]
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Calculate Latencies
-
-# COMMAND ----------
-
-from datetime import timezone
-
-def to_seconds(td):
-    if td is None:
-        return None
-    return round(td.total_seconds(), 1)
-
-# Batch path: file ingested_at → gold refresh
-batch_prebronze_to_gold = None
-if prebronze_latest and gold_last_refresh:
-    if hasattr(prebronze_latest, 'tzinfo') and prebronze_latest.tzinfo:
-        gold_ts = gold_last_refresh.replace(tzinfo=timezone.utc) if gold_last_refresh.tzinfo is None else gold_last_refresh
-        batch_prebronze_to_gold = to_seconds(gold_ts - prebronze_latest)
-    else:
-        batch_prebronze_to_gold = to_seconds(gold_last_refresh - prebronze_latest)
-
-# Streaming path: event_ts → silver arrival
-stream_to_silver = None
-if domain_latest and domain_gold:
-    stream_to_silver = to_seconds(domain_gold - domain_latest)
-
-# Layer-to-layer: prebronze → bronze
-prebronze_to_bronze = None
-if prebronze_latest and bronze_latest:
-    prebronze_to_bronze = to_seconds(bronze_latest - prebronze_latest)
-
-print(f"Run timestamp:           {run_ts}")
-print(f"Latest prebronze alert:  {prebronze_latest}")
-print(f"Latest bronze alert:     {bronze_latest}")
-print(f"Gold last refresh:       {gold_last_refresh}")
-print(f"Latest domain event:     {domain_latest}")
-print(f"Domain event in silver:  {domain_gold}")
+print(f"Run timestamp:           {row['run_ts']}")
+print(f"Latest prebronze alert:  {row['prebronze_latest']}")
+print(f"Latest bronze alert:     {row['bronze_latest']}")
+print(f"Gold last refresh:       {row['gold_last_refresh']}")
+print(f"Latest domain event:     {row['domain_latest']}")
+print(f"Domain event in silver:  {row['domain_in_silver']}")
 print()
 print(f"--- Latency Results ---")
-print(f"Prebronze → Bronze:      {prebronze_to_bronze}s")
-print(f"Prebronze → Gold:        {batch_prebronze_to_gold}s")
-print(f"Stream event → Silver:   {stream_to_silver}s")
-
-# SLA check
-BATCH_SLA_SEC = 15 * 60  # 15 minutes
-STREAM_SLA_SEC = 5 * 60  # 5 minutes
-
-batch_ok = batch_prebronze_to_gold is not None and batch_prebronze_to_gold < BATCH_SLA_SEC
-stream_ok = stream_to_silver is not None and abs(stream_to_silver) < STREAM_SLA_SEC
-
+print(f"Prebronze -> Bronze:     {row['prebronze_to_bronze_sec']}s")
+print(f"Prebronze -> Gold:       {row['prebronze_to_gold_sec']}s")
+print(f"Stream event -> Silver:  {row['stream_to_silver_sec']}s")
 print()
-print(f"Batch SLA (<15 min):     {'PASS' if batch_ok else 'FAIL'} ({batch_prebronze_to_gold}s vs {BATCH_SLA_SEC}s)")
-print(f"Stream SLA (<5 min):     {'PASS' if stream_ok else 'FAIL'} ({stream_to_silver}s vs {STREAM_SLA_SEC}s)")
+print(f"Batch SLA (<15 min):     {'PASS' if row['batch_sla_pass'] else 'FAIL'} ({row['prebronze_to_gold_sec']}s vs 900s)")
+print(f"Stream SLA (<5 min):     {'PASS' if row['stream_sla_pass'] else 'FAIL'} ({row['stream_to_silver_sec']}s vs 300s)")
 
 # COMMAND ----------
 
@@ -118,35 +65,83 @@ print(f"Stream SLA (<5 min):     {'PASS' if stream_ok else 'FAIL'} ({stream_to_s
 
 # COMMAND ----------
 
-metrics_data = [(
-    run_ts,
-    str(prebronze_latest),
-    str(bronze_latest),
-    str(gold_last_refresh),
-    str(domain_latest),
-    str(domain_gold),
-    prebronze_to_bronze,
-    batch_prebronze_to_gold,
-    stream_to_silver,
-    batch_ok,
-    stream_ok
-)]
+latency_df.write.mode("append").saveAsTable("waggoner_mom.prebronze._latency_metrics")
+print("Metrics logged to waggoner_mom.prebronze._latency_metrics")
 
-metrics_schema = StructType([
-    StructField("run_ts", StringType()),
-    StructField("prebronze_latest", StringType()),
-    StructField("bronze_latest", StringType()),
-    StructField("gold_last_refresh", StringType()),
-    StructField("domain_latest_event", StringType()),
-    StructField("domain_in_silver", StringType()),
-    StructField("prebronze_to_bronze_sec", DoubleType()),
-    StructField("prebronze_to_gold_sec", DoubleType()),
-    StructField("stream_to_silver_sec", DoubleType()),
-    StructField("batch_sla_pass", BooleanType()),
-    StructField("stream_sla_pass", BooleanType())
-])
+# COMMAND ----------
 
-metrics_df = spark.createDataFrame(metrics_data, schema=metrics_schema)
-metrics_df.write.mode("append").saveAsTable("waggoner_mom.prebronze._latency_metrics")
+# MAGIC %md
+# MAGIC ## Latency Dashboard
 
-print(f"Metrics logged to waggoner_mom.prebronze._latency_metrics")
+# COMMAND ----------
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+metrics_hist = spark.sql("""
+  SELECT run_ts, prebronze_to_bronze_sec, prebronze_to_gold_sec, stream_to_silver_sec,
+         batch_sla_pass, stream_sla_pass
+  FROM waggoner_mom.prebronze._latency_metrics
+  ORDER BY run_ts DESC
+  LIMIT 20
+""").toPandas()
+
+if len(metrics_hist) > 0:
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Pipeline Latency Monitor", fontsize=14, fontweight="bold")
+
+    # Bar chart: latest run latencies
+    labels = ["Prebronze→Bronze", "Prebronze→Gold", "Stream→Silver"]
+    values = [
+        row["prebronze_to_bronze_sec"] or 0,
+        row["prebronze_to_gold_sec"] or 0,
+        row["stream_to_silver_sec"] or 0
+    ]
+    sla_limits = [None, 900, 300]
+    colors = ["#1f77b4", "#2ca02c" if row["batch_sla_pass"] else "#d62728",
+              "#2ca02c" if row["stream_sla_pass"] else "#d62728"]
+
+    bars = axes[0].bar(labels, values, color=colors)
+    if sla_limits[1]:
+        axes[0].axhline(y=900, color="red", linestyle="--", alpha=0.5, label="Batch SLA (900s)")
+    if sla_limits[2]:
+        axes[0].axhline(y=300, color="orange", linestyle="--", alpha=0.5, label="Stream SLA (300s)")
+    axes[0].set_ylabel("Seconds")
+    axes[0].set_title("Current Run Latency")
+    axes[0].legend(fontsize=8)
+    for bar, val in zip(bars, values):
+        axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5,
+                     f"{val:.0f}s", ha="center", va="bottom", fontsize=9)
+
+    # Trend: batch latency over time
+    if len(metrics_hist) > 1:
+        hist_sorted = metrics_hist.sort_values("run_ts")
+        axes[1].plot(range(len(hist_sorted)), hist_sorted["prebronze_to_gold_sec"], "o-", color="#2ca02c", label="Batch")
+        axes[1].axhline(y=900, color="red", linestyle="--", alpha=0.5, label="SLA (900s)")
+        axes[1].set_xlabel("Run #")
+        axes[1].set_ylabel("Seconds")
+        axes[1].set_title("Batch Latency Trend")
+        axes[1].legend(fontsize=8)
+    else:
+        axes[1].text(0.5, 0.5, "Need more runs\nfor trend", ha="center", va="center", transform=axes[1].transAxes)
+        axes[1].set_title("Batch Latency Trend")
+
+    # SLA scoreboard
+    axes[2].axis("off")
+    batch_color = "#2ca02c" if row["batch_sla_pass"] else "#d62728"
+    stream_color = "#2ca02c" if row["stream_sla_pass"] else "#d62728"
+    batch_text = "PASS" if row["batch_sla_pass"] else "FAIL"
+    stream_text = "PASS" if row["stream_sla_pass"] else "FAIL"
+
+    axes[2].text(0.5, 0.75, "Batch SLA (<15 min)", ha="center", va="center", fontsize=14, transform=axes[2].transAxes)
+    axes[2].text(0.5, 0.6, batch_text, ha="center", va="center", fontsize=28, fontweight="bold",
+                 color=batch_color, transform=axes[2].transAxes)
+    axes[2].text(0.5, 0.35, "Stream SLA (<5 min)", ha="center", va="center", fontsize=14, transform=axes[2].transAxes)
+    axes[2].text(0.5, 0.2, stream_text, ha="center", va="center", fontsize=28, fontweight="bold",
+                 color=stream_color, transform=axes[2].transAxes)
+    axes[2].set_title("SLA Status")
+
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No metrics history yet — run the job at least once.")

@@ -15,7 +15,7 @@ resources:
             notebook_path: /Workspace/Users/tanner.waggoner@databricks.com/mom_data_generation/03_live_stream_producer
             source: WORKSPACE
           environment_key: default
-          timeout_seconds: 120
+          timeout_seconds: 300
 
         - task_key: refresh_pipeline
           depends_on:

@@ -45,10 +45,11 @@ start_time = datetime.now()
 
 print(f"Starting live event producer at {start_time.isoformat()}")
 print(f"Writing to: {VOLUME_PATH}")
-print("Press Cancel to stop.")
+MAX_DURATION_SEC = 90  # Run for 90 seconds then exit cleanly
+print(f"Will run for {MAX_DURATION_SEC}s then exit.")
 
 try:
-    while True:
+    while (datetime.now() - start_time).total_seconds() < MAX_DURATION_SEC:
         now = datetime.now()
         batch_size = random.randint(3, 5)
 
