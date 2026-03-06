@@ -11,5 +11,5 @@ resources:
         source_volume: "/Volumes/waggoner_mom/prebronze/partner_files"
         schema_location_base: "/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas"
       libraries:
-        - file:
-            path: src/mom_pipeline/transformations
+        - glob:
+            include: ../src/mom_pipeline/transformations/**
