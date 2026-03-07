@@ -607,18 +607,24 @@ A notebook that writes domain event JSON files to the S3 volume for 90 seconds, 
 
 The SDP pipeline is triggered automatically after both generators complete, processing the new files through all 4 layers.
 
-#### Task 4: Latency Monitor (`04_latency_monitor.py`)
+#### Task 4: Latency & Throughput Monitor (`04_latency_monitor.py`)
 
-Measures hop-by-hop latency across the medallion layers using `unix_timestamp()` comparisons in SQL:
+Measures per-layer latency and throughput using the **SDP event log** (`prebronze.event_log_<pipeline_id>`), which records the exact completion time and row count for every dataset in each pipeline update. This gives accurate ingestion-to-gold timing — not proxy timestamps.
 
-| Metric | Measurement | Target |
-|--------|-------------|--------|
-| **Prebronze → Bronze** | `MAX(_ingested_at)` in bronze - `MAX(_ingested_at)` in prebronze | — |
-| **Bronze → Gold** | `current_timestamp()` (post-refresh) - `MAX(_ingested_at)` in bronze | — |
-| **Total Batch** | Gold refresh time - prebronze ingestion time | < 15 minutes (900s) |
-| **Total Stream** | Silver domain_event_ts - prebronze event_ts | < 5 minutes (300s) |
+| Metric | Source | Per Layer |
+|--------|--------|-----------|
+| **Layer duration** | `flow_progress` event timestamps (start → end per layer) | Prebronze, Bronze, Silver, Gold |
+| **Cumulative latency** | Time from first prebronze completion to last gold completion | End-to-end |
+| **Rows written** | `details:flow_progress:metrics:num_output_rows` | Per dataset and per layer |
+| **Throughput (rows/sec)** | `total_rows / layer_duration_sec` | Per layer |
+| **SLA check** | Cumulative latency < 900s (15 min) | Batch path |
 
-Results are logged to `waggoner_mom.prebronze._latency_metrics` and displayed as a waterfall chart showing cumulative latency at each layer with SLA threshold lines.
+Output includes:
+- **Text summary table** with duration, cumulative, rows, rows/sec, and table count per layer
+- **Waterfall chart** showing cumulative latency building across layers with SLA line
+- **Throughput bar chart** showing rows/sec and total rows per layer
+
+Results are logged to `waggoner_mom.prebronze._latency_metrics`.
 
 The demo job is triggered manually: `databricks bundle run mom_demo_job --profile e2-field`
 
@@ -629,7 +635,7 @@ The demo job is triggered manually: `databricks bundle run mom_demo_job --profil
 | **Backfill script** | `01_backfill.py` — Python notebook using Faker + Spark | Generates 7 days of data, creates entity pool |
 | **Live batch generator** | `02_live_batch_generator.py` — Python notebook | Writes incremental CSV files to S3 volume |
 | **Live stream producer** | `03_live_stream_producer.py` — Python notebook (90s loop) | Writes JSON event files to volume (simulates Kafka) |
-| **Latency monitor** | `04_latency_monitor.py` — Python notebook | Hop-by-hop latency measurement with waterfall chart |
+| **Latency monitor** | `04_latency_monitor.py` — Python notebook | Per-layer latency + throughput from SDP event log, waterfall + bar charts |
 | **Demo job** | `mom_demo_job.job.yml` — DABs job resource | 4-task chain: generate → refresh → monitor |
 | **Metric views** | `create_metric_views.py` — separate notebook | Created outside SDP pipeline |
 | **Shared ID pool** | Delta table `waggoner_mom.prebronze._entity_ids` | Generated once during backfill, reused by live generators |
