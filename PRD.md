@@ -21,12 +21,13 @@ This addresses common pain points in fintech data architectures:
 ## 2. Demo Scope
 
 ### In Scope
-- Pre-Bronze: Append-only raw ingestion from Kafka (streaming) and S3 volume (batch Auto Loader)
-- Bronze: Merge/upsert to current state — deduplicated, one clean table per source
-- Silver: 3NF normalized tables with static-stream join (batch bronze + streaming pre-bronze unified)
-- Gold: Denormalized aggregation tables and metric views for analytics
+- Pre-Bronze: Append-only raw ingestion from S3 volume — batch via Auto Loader, streaming simulated via JSON files (production path: Kafka)
+- Bronze: Merge/upsert to current state via AUTO CDC (SCD Type 1) — deduplicated, one clean table per source
+- Silver: 3NF normalized tables with static-stream join (batch bronze + streaming domain events unified). Two table types: AUTO CDC SCD2 for single-source entities, materialized views for multi-source joins.
+- Gold: Denormalized fact and dimension tables (materialized views) + materialized metric views (created outside SDP pipeline)
 - Genie Space for natural language querying of gold layer
-- Full pipeline orchestrated as a single SDP pipeline with medallion architecture
+- Demo job: data generation → pipeline refresh → latency monitoring in one triggered run
+- Full pipeline orchestrated as a single SDP pipeline with medallion architecture via DABs
 
 ### Out of Scope
 - PII encryption/decryption
@@ -178,13 +179,13 @@ This addresses common pain points in fintech data architectures:
 
 All pre-bronze tables are **streaming tables** with append-only semantics. This layer is the **immutable audit trail** — every file delivery and every streaming event is preserved exactly as received. No deduplication, no merge, no transformation beyond metadata enrichment.
 
-#### Streaming Sources (Kafka)
+#### Streaming Sources (File-Based Simulation)
 
-These represent domain service events published from upstream microservices. Volumes are TBD — the partner file stats below do not cover streaming; these will be determined during integration.
+Domain service events are simulated via JSON files written to the S3 volume. In production, this would be replaced with `read_kafka()` for real Kafka ingestion. The demo uses Auto Loader (`read_files()`) on JSON files so the pipeline works without Kafka infrastructure.
 
-| Table | Source Topic | Key Fields | Notes |
-|-------|-------------|------------|-------|
-| `prebronze_domain_events` | `finserv.domain_events` | `event_id`, `entity_type`, `entity_id`, `event_ts` | Domain service CDC events; volumes TBD |
+| Table | Source Path | Format | Key Fields | Notes |
+|-------|------------|--------|------------|-------|
+| `prebronze_domain_events` | `.../domain_events/` | JSON | `event_id`, `entity_type`, `entity_id`, `event_ts` | Simulated domain events; ~5K/day demo |
 
 #### Batch Sources (Auto Loader from S3 Volume — Partner Data Files)
 
@@ -333,13 +334,19 @@ Gold dimension tables are **materialized views** that expose current state for d
 
 Metric views are **materialized** to pre-compute aggregations for fast query performance. Databricks automatically creates a managed Lakeflow SDP pipeline that refreshes the materializations on schedule. At query time, aggregate-aware query rewriting routes queries to the pre-computed views (fast path) or falls back to source data when materializations aren't available.
 
-Each metric view specifies a `materialization` block in its YAML definition with a refresh schedule, mode (`relaxed`), and one or more materialized views (either `aggregated` for specific measure-dimension combos, or `unaggregated` for full data model coverage).
+**Important:** Metric views are created **outside the SDP pipeline** via a separate notebook (`create_metric_views.py`). The `CREATE OR REPLACE VIEW ... WITH METRICS LANGUAGE YAML AS $$ ... $$` syntax is not supported inside SDP pipeline SQL files. The notebook must `USE CATALOG waggoner_mom` and `USE SCHEMA gold` before creating the views.
+
+Each metric view YAML definition uses:
+- `source`: Fully-qualified table name (e.g., `waggoner_mom.gold.gold_fact_daily_transactions`)
+- `dimensions`: Each with `name` and `expr` (SQL expression, not `column`)
+- `measures`: Each with `name` and `expr` (aggregate SQL expression like `SUM(amount)`)
+- `materialization`: `schedule` (string like `every 2 hours`), `mode: relaxed`, and `materialized_views` list
 
 | Metric View | Source Table | Dimensions | Measures | Materialization Type |
 |-------------|-------------|------------|----------|---------------------|
-| `gold_mv_transaction_kpis` | `gold_fact_daily_transactions` | `Payment Date`, `Payment Type`, `Account ID` | `Total Transactions`, `Total Volume`, `Avg Transaction Value`, `Volume per Account` | `aggregated` |
-| `gold_mv_user_health` | `gold_fact_user_activity` | `Activity Month`, `User Segment` | `Active Users`, `Avg Spend per User`, `Churn Risk Count` | `aggregated` |
-| `gold_mv_risk_operations` | `gold_fact_risk_operations` | `Operation Month`, `Operation Type` | `Total Disputes`, `Total Disputed Amount`, `Avg Resolution Days`, `False Positive Rate` | `aggregated` |
+| `gold_mv_transaction_kpis` | `gold_fact_daily_transactions` | `payment_date`, `payment_type`, `account_id` | `SUM(txn_count)`, `SUM(total_amount)`, `SUM(total_amount)/SUM(txn_count)` | `aggregated` |
+| `gold_mv_user_health` | `gold_fact_user_activity` | `DATE_TRUNC('MONTH', activity_date)`, `user_id` | `COUNT(DISTINCT user_id)`, `AVG(total_spend)`, `SUM(alert_count)` | `aggregated` |
+| `gold_mv_risk_operations` | `gold_fact_risk_operations` | `DATE_TRUNC('MONTH', operation_date)`, `operation_type` | `SUM(operation_count)`, `SUM(dispute_count)`, `SUM(total_disputed_amount)` | `aggregated` |
 
 ---
 
@@ -354,7 +361,7 @@ Each metric view specifies a `materialization` block in its YAML definition with
 | **Compute** | Serverless | No cluster management, auto-scaling |
 | **Project Structure** | Databricks Asset Bundles (DABs) | Multi-environment support, `databricks pipelines init` |
 | **Ingestion (batch)** | `read_files()` with `STREAM` | Auto Loader pattern via SQL |
-| **Ingestion (stream)** | `read_kafka()` or simulated via files | Kafka integration or file-based simulation |
+| **Ingestion (stream)** | `read_files()` on JSON (file-based simulation) | Simulates Kafka; swap to `read_kafka()` for production |
 | **CDC** | AUTO CDC with SCD Type 1 & 2 | Built-in dedup and history tracking |
 | **Metric Views** | Unity Catalog YAML metric views (materialized) | Governed KPI definitions with pre-computed aggregations |
 | **Clustering** | `CLUSTER BY` (Liquid Clustering) | Modern default, not `PARTITION BY` |
@@ -377,84 +384,100 @@ resources:
         gold_schema: "gold"
         source_volume: "/Volumes/waggoner_mom/prebronze/partner_files"
         schema_location_base: "/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas"
+      libraries:
+        - glob:
+            include: ../src/mom_pipeline/transformations/**
 ```
 
 ### 6.3 File Structure
 
 ```
 batch-stream-medallion/
-├── PRD.md                          # This document
-├── databricks.yml                  # Asset Bundle config (dev/prod)
+├── PRD.md                              # This document
+├── README.md                           # Architecture overview and rationale
+├── databricks.yml                      # Asset Bundle config (dev/prod)
 ├── resources/
-│   └── mom_pipeline.pipeline.yml   # Pipeline resource definition
+│   ├── mom_pipeline.pipeline.yml       # SDP pipeline resource definition
+│   └── mom_demo_job.job.yml            # Demo job: generate data → refresh → monitor
 └── src/
     └── mom_pipeline/
-        └── transformations/
-            ├── prebronze/
-            │   ├── prebronze_domain_events.sql           # Kafka streaming
-            │   ├── prebronze_users.sql                    # Auto Loader batch (10.2M/day)
-            │   ├── prebronze_linked_accounts.sql          # Auto Loader batch (6.1M/day)
-            │   ├── prebronze_account_balances.sql         # Auto Loader batch (5M/day)
-            │   ├── prebronze_alerts.sql                   # Auto Loader batch (2M/day)
-            │   ├── prebronze_payment_events.sql           # Auto Loader batch (1.4M/day)
-            │   ├── prebronze_card_payments.sql            # Auto Loader batch (580K/day)
-            │   ├── prebronze_settled_payments.sql         # Auto Loader batch (420K/day)
-            │   ├── prebronze_wire_transfers.sql           # Auto Loader batch (350K/day)
-            │   ├── prebronze_verification_checks.sql      # Auto Loader batch (140K/day)
-            │   ├── prebronze_portal_activity.sql          # Auto Loader batch (130K/day)
-            │   ├── prebronze_ach_payments.sql             # Auto Loader batch (80K/day)
-            │   ├── prebronze_card_profiles.sql            # Auto Loader batch (10K/day)
-            │   ├── prebronze_risk_operations.sql          # Auto Loader batch (9K/day)
-            │   ├── prebronze_rule_performance.sql         # Auto Loader batch (6K/day)
-            │   ├── prebronze_disputes.sql                 # Auto Loader batch (disputes + status)
-            │   ├── prebronze_portal_users_logins.sql      # Auto Loader batch (logins, searches, users)
-            │   ├── prebronze_verification_logins.sql      # Auto Loader batch (600/day)
-            │   ├── prebronze_rule_summaries.sql           # Auto Loader batch (10/day)
-            │   └── prebronze_case_records.sql             # Auto Loader batch (<5/day)
-            ├── bronze/
-            │   ├── bronze_domain_events.sql           # Streaming pass-through
-            │   ├── bronze_users.sql                    # AUTO CDC merge from prebronze
-            │   ├── bronze_linked_accounts.sql          # AUTO CDC merge from prebronze
-            │   ├── bronze_account_balances.sql         # AUTO CDC merge from prebronze
-            │   ├── bronze_alerts.sql                   # AUTO CDC merge from prebronze
-            │   ├── bronze_payment_events.sql           # AUTO CDC merge from prebronze
-            │   ├── bronze_card_payments.sql            # AUTO CDC merge from prebronze
-            │   ├── bronze_settled_payments.sql         # AUTO CDC merge from prebronze
-            │   ├── bronze_wire_transfers.sql           # AUTO CDC merge from prebronze
-            │   ├── bronze_ach_payments.sql             # AUTO CDC merge from prebronze
-            │   ├── bronze_card_profiles.sql            # AUTO CDC merge from prebronze
-            │   ├── bronze_verification_checks.sql      # AUTO CDC merge from prebronze
-            │   ├── bronze_portal_activity.sql          # AUTO CDC merge from prebronze
-            │   ├── bronze_portal_logins.sql            # AUTO CDC merge from prebronze
-            │   ├── bronze_portal_searches.sql          # AUTO CDC merge from prebronze
-            │   ├── bronze_portal_users.sql             # AUTO CDC merge from prebronze
-            │   ├── bronze_risk_operations.sql          # AUTO CDC merge from prebronze
-            │   ├── bronze_rule_performance.sql         # AUTO CDC merge from prebronze
-            │   ├── bronze_rule_summaries.sql           # AUTO CDC merge from prebronze
-            │   ├── bronze_dispute_records.sql          # AUTO CDC merge from prebronze
-            │   ├── bronze_dispute_status_changes.sql   # AUTO CDC merge from prebronze
-            │   └── bronze_case_records.sql             # AUTO CDC merge from prebronze
-            ├── silver/
-            │   ├── silver_users.sql                # AUTO CDC SCD2 (single source)
-            │   ├── silver_cards.sql                # AUTO CDC SCD2 (single source)
-            │   ├── silver_accounts.sql             # Materialized view (join: balances + linked)
-            │   ├── silver_transactions.sql         # Materialized view (static-stream join)
-            │   ├── silver_cards_enriched.sql       # Materialized view (join: profiles + events)
-            │   ├── silver_alerts.sql               # Materialized view (union: alerts + events)
-            │   ├── silver_verifications.sql        # Materialized view (join: checks + logins)
-            │   ├── silver_portal_activity.sql      # Materialized view (union: portal streams)
-            │   └── silver_risk_operations.sql      # Materialized view (union: disputes+cases+rules)
-            └── gold/
-                ├── gold_fact_daily_transactions.sql
-                ├── gold_fact_user_activity.sql
-                ├── gold_fact_risk_operations.sql
-                ├── gold_agg_risk_summary.sql
-                ├── gold_dim_users.sql
-                ├── gold_dim_accounts.sql
-                ├── gold_dim_cards.sql
-                ├── gold_mv_transaction_kpis.sql    # Metric view
-                ├── gold_mv_user_health.sql         # Metric view
-                └── gold_mv_risk_operations.sql     # Metric view
+        ├── transformations/            # SDP pipeline SQL (included via glob pattern)
+        │   ├── prebronze/              # 23 streaming tables (Auto Loader + file-based stream)
+        │   │   ├── prebronze_domain_events.sql       # File-based stream simulation (JSON)
+        │   │   ├── prebronze_users.sql                # Auto Loader batch (10.2M/day)
+        │   │   ├── prebronze_linked_accounts.sql      # Auto Loader batch (6.1M/day)
+        │   │   ├── prebronze_account_balances.sql     # Auto Loader batch (5M/day)
+        │   │   ├── prebronze_alerts.sql               # Auto Loader batch (2M/day)
+        │   │   ├── prebronze_payment_events.sql       # Auto Loader batch (1.4M/day)
+        │   │   ├── prebronze_card_payments.sql        # Auto Loader batch (580K/day)
+        │   │   ├── prebronze_settled_payments.sql     # Auto Loader batch (420K/day)
+        │   │   ├── prebronze_wire_transfers.sql       # Auto Loader batch (350K/day)
+        │   │   ├── prebronze_verification_checks.sql  # Auto Loader batch (140K/day)
+        │   │   ├── prebronze_portal_activity.sql      # Auto Loader batch (130K/day)
+        │   │   ├── prebronze_ach_payments.sql         # Auto Loader batch (80K/day)
+        │   │   ├── prebronze_card_profiles.sql        # Auto Loader batch (JSON, 10K/day)
+        │   │   ├── prebronze_risk_operations.sql      # Auto Loader batch (9K/day)
+        │   │   ├── prebronze_rule_performance.sql     # Auto Loader batch (6K/day)
+        │   │   ├── prebronze_portal_logins.sql        # Auto Loader batch (1K/day)
+        │   │   ├── prebronze_portal_searches.sql      # Auto Loader batch (1.2K/day)
+        │   │   ├── prebronze_dispute_records.sql      # Auto Loader batch (1K/day)
+        │   │   ├── prebronze_verification_logins.sql  # Auto Loader batch (600/day)
+        │   │   ├── prebronze_dispute_status_changes.sql # Auto Loader batch (300/day)
+        │   │   ├── prebronze_portal_users.sql         # Auto Loader batch (20/day)
+        │   │   ├── prebronze_rule_summaries.sql       # Auto Loader batch (10/day)
+        │   │   └── prebronze_case_records.sql         # Auto Loader batch (<5/day)
+        │   ├── bronze/                 # 23 tables (22 AUTO CDC SCD1 + 1 streaming pass-through)
+        │   │   ├── bronze_domain_events.sql           # Streaming pass-through
+        │   │   ├── bronze_users.sql                   # AUTO CDC merge
+        │   │   ├── bronze_linked_accounts.sql
+        │   │   ├── bronze_account_balances.sql
+        │   │   ├── bronze_alerts.sql
+        │   │   ├── bronze_payment_events.sql
+        │   │   ├── bronze_card_payments.sql
+        │   │   ├── bronze_settled_payments.sql
+        │   │   ├── bronze_wire_transfers.sql
+        │   │   ├── bronze_ach_payments.sql
+        │   │   ├── bronze_card_profiles.sql
+        │   │   ├── bronze_verification_checks.sql
+        │   │   ├── bronze_verification_logins.sql
+        │   │   ├── bronze_portal_activity.sql
+        │   │   ├── bronze_portal_logins.sql
+        │   │   ├── bronze_portal_searches.sql
+        │   │   ├── bronze_portal_users.sql
+        │   │   ├── bronze_risk_operations.sql
+        │   │   ├── bronze_rule_performance.sql
+        │   │   ├── bronze_rule_summaries.sql
+        │   │   ├── bronze_dispute_records.sql
+        │   │   ├── bronze_dispute_status_changes.sql
+        │   │   └── bronze_case_records.sql
+        │   ├── silver/                 # 9 tables (2 AUTO CDC SCD2 + 7 materialized views)
+        │   │   ├── silver_users.sql               # AUTO CDC SCD2
+        │   │   ├── silver_cards.sql               # AUTO CDC SCD2
+        │   │   ├── silver_accounts.sql            # MV (join: balances + linked)
+        │   │   ├── silver_transactions.sql        # MV (static-stream join)
+        │   │   ├── silver_cards_enriched.sql      # MV (join: profiles + events)
+        │   │   ├── silver_alerts.sql              # MV (union: alerts + events)
+        │   │   ├── silver_verifications.sql       # MV (join: checks + logins)
+        │   │   ├── silver_portal_activity.sql     # MV (union: portal streams)
+        │   │   └── silver_risk_operations.sql     # MV (union: disputes+cases+rules)
+        │   └── gold/                   # 7 materialized views (4 facts + 3 dims)
+        │       ├── gold_fact_daily_transactions.sql
+        │       ├── gold_fact_user_activity.sql
+        │       ├── gold_fact_risk_operations.sql
+        │       ├── gold_agg_risk_summary.sql
+        │       ├── gold_dim_users.sql
+        │       ├── gold_dim_accounts.sql
+        │       └── gold_dim_cards.sql
+        ├── metric_views/               # Created outside SDP (separate notebook)
+        │   ├── create_metric_views.py  # Notebook that creates all 3 metric views
+        │   ├── gold_mv_transaction_kpis.sql   # Reference SQL
+        │   ├── gold_mv_user_health.sql        # Reference SQL
+        │   └── gold_mv_risk_operations.sql    # Reference SQL
+        └── data_generation/            # Synthetic data notebooks
+            ├── 01_backfill.py          # Phase 1: 7-day historical backfill
+            ├── 02_live_batch_generator.py   # Phase 2: incremental batch files
+            ├── 03_live_stream_producer.py   # Phase 2: domain event producer (90s loop)
+            └── 04_latency_monitor.py   # SLA monitoring with waterfall chart
 ```
 
 ---
@@ -486,8 +509,9 @@ When building this pipeline with the AI Dev Kit Claude Code plugin, follow these
 
 ### Metric Views (Materialized)
 - Require **Databricks Runtime 17.2+** and **serverless compute**
-- Define in SQL with `CREATE OR REPLACE VIEW ... WITH METRICS LANGUAGE YAML`
-- Include `materialization` block in YAML: schedule, mode (`relaxed`), and materialized views (`aggregated` or `unaggregated`)
+- **Created outside SDP pipeline** — `CREATE OR REPLACE VIEW ... WITH METRICS LANGUAGE YAML AS $$ ... $$` is not parseable inside SDP SQL files
+- Created via `create_metric_views.py` notebook, which runs `USE CATALOG waggoner_mom` then `spark.sql()` for each view
+- YAML uses `source: catalog.schema.table` (string), `expr` for dimensions/measures (SQL expressions), `materialization.schedule` as string (e.g., `every 2 hours`)
 - Databricks auto-creates a managed SDP pipeline for refreshing materializations
 - Queries automatically route to pre-computed views (fast path) when available
 - All measures must be queried with `MEASURE()` function
@@ -543,7 +567,13 @@ A one-time backfill script generates **7 days of historical data** so gold table
 
 ### 8.2 Phase 2: Live Generator (Continuous During Demo)
 
-A **Databricks job with two tasks** runs continuously during the demo to generate fresh data and prove SLA compliance:
+A **Databricks job (`mom_demo_live_data`)** with four tasks runs on-demand during the demo to generate fresh data, refresh the pipeline, and verify SLA compliance:
+
+```
+generate_batch_files ──┐
+                       ├──→ refresh_pipeline ──→ check_latency
+generate_stream_events ┘
+```
 
 #### Task 1: Batch File Generator (runs every 2 minutes)
 
@@ -560,9 +590,9 @@ A scheduled notebook that generates new partner files and writes them to the S3 
 
 Full-snapshot files (users, balances, linked accounts) are **not regenerated** during live demo — they arrive daily, so backfill covers them. Only incremental file types get new files during the demo.
 
-#### Task 2: Streaming Event Producer (runs continuously)
+#### Task 2: Streaming Event Producer (runs for 90 seconds)
 
-A long-running notebook that produces domain events to Kafka (or writes JSON files to a simulation volume as fallback):
+A notebook that writes domain event JSON files to the S3 volume for 90 seconds, simulating streaming ingestion. Exits cleanly within the job timeout.
 
 | Setting | Value |
 |---------|-------|
@@ -571,26 +601,37 @@ A long-running notebook that produces domain events to Kafka (or writes JSON fil
 | **Entity references** | Draws from the same ID pool as backfill for join consistency |
 | **Timestamp** | `event_ts` = `current_timestamp()` at generation time — used to measure end-to-end latency |
 
-#### SLA Measurement
+#### Task 3: Pipeline Refresh
 
-Latency is measured by comparing timestamps at generation vs. arrival at gold:
+The SDP pipeline is triggered automatically after both generators complete, processing the new files through all 4 layers.
 
-| Path | Measurement | Target |
-|------|-------------|--------|
-| **Streaming** | `event_ts` (generated) → `gold` table refresh timestamp | < 5 minutes |
-| **Batch** | File write timestamp in volume → `_ingested_at` in pre-bronze → `gold` refresh | < 15 minutes |
+#### Task 4: Latency Monitor (`04_latency_monitor.py`)
 
-The pipeline should run in **continuous mode** (or triggered every 1-2 minutes) to meet the streaming SLA. Batch SLA is met as long as Auto Loader picks up files within a few pipeline trigger intervals.
+Measures hop-by-hop latency across the medallion layers using `unix_timestamp()` comparisons in SQL:
+
+| Metric | Measurement | Target |
+|--------|-------------|--------|
+| **Prebronze → Bronze** | `MAX(_ingested_at)` in bronze - `MAX(_ingested_at)` in prebronze | — |
+| **Bronze → Gold** | `current_timestamp()` (post-refresh) - `MAX(_ingested_at)` in bronze | — |
+| **Total Batch** | Gold refresh time - prebronze ingestion time | < 15 minutes (900s) |
+| **Total Stream** | Silver domain_event_ts - prebronze event_ts | < 5 minutes (300s) |
+
+Results are logged to `waggoner_mom.prebronze._latency_metrics` and displayed as a waterfall chart showing cumulative latency at each layer with SLA threshold lines.
+
+The demo job is triggered manually: `databricks bundle run mom_demo_job --profile e2-field`
 
 ### 8.3 Implementation
 
 | Component | Implementation | Notes |
 |-----------|---------------|-------|
-| **Backfill script** | Python notebook using Faker + Spark | Use `databricks-synthetic-data-generation` AI Dev Kit skill |
-| **Live batch generator** | Python notebook, scheduled as Databricks Job (every 2 min) | Writes CSV/JSON files to S3 volume |
-| **Live stream producer** | Python notebook, long-running Databricks Job task | Kafka producer or file-based fallback |
-| **Shared ID pool** | Generated once during backfill, stored as Delta table in `prebronze` | `_entity_ids` table with `user_id`, `account_id`, `card_id` pools |
-| **Pipeline mode** | Continuous or triggered (1-2 min interval) | Required to meet 5-min streaming SLA |
+| **Backfill script** | `01_backfill.py` — Python notebook using Faker + Spark | Generates 7 days of data, creates entity pool |
+| **Live batch generator** | `02_live_batch_generator.py` — Python notebook | Writes incremental CSV files to S3 volume |
+| **Live stream producer** | `03_live_stream_producer.py` — Python notebook (90s loop) | Writes JSON event files to volume (simulates Kafka) |
+| **Latency monitor** | `04_latency_monitor.py` — Python notebook | Hop-by-hop latency measurement with waterfall chart |
+| **Demo job** | `mom_demo_job.job.yml` — DABs job resource | 4-task chain: generate → refresh → monitor |
+| **Metric views** | `create_metric_views.py` — separate notebook | Created outside SDP pipeline |
+| **Shared ID pool** | Delta table `waggoner_mom.prebronze._entity_ids` | Generated once during backfill, reused by live generators |
+| **Pipeline mode** | Triggered per demo job run | Each run generates data, refreshes pipeline, checks SLA |
 
 ### 8.4 Data Relationships
 
@@ -662,12 +703,15 @@ Pre-configured questions to guide users and validate accuracy:
 
 ## 10. Success Criteria
 
-- [ ] Pipeline deploys and runs successfully on E2 Field workspace
-- [ ] Pre-bronze tables ingest from both Kafka (stream) and S3 volume (batch)
-- [ ] Bronze tables merge pre-bronze to current state via AUTO CDC
-- [ ] Silver `silver_transactions` demonstrates static-stream join
-- [ ] Gold aggregation tables refresh correctly from silver
-- [ ] Metric views are queryable with `MEASURE()` syntax
+- [x] Pipeline deploys and runs successfully on E2 Field workspace
+- [x] Pre-bronze tables ingest from file-based stream simulation and S3 volume (batch)
+- [x] Bronze tables merge pre-bronze to current state via AUTO CDC (SCD Type 1)
+- [x] Silver `silver_transactions` demonstrates static-stream join (4 payment types + domain events)
+- [x] Silver `silver_users` and `silver_cards` track history via AUTO CDC (SCD Type 2)
+- [x] Gold aggregation tables refresh correctly from silver
+- [x] Materialized metric views created and queryable with `MEASURE()` syntax
+- [x] Demo job generates data, refreshes pipeline, and monitors latency in one run
+- [x] Latency monitor measures hop-by-hop latency with waterfall visualization
 - [ ] Genie Space created with all gold tables and metric views
 - [ ] Genie Space answers sample certified questions accurately
 - [ ] Source-to-gold latency under 5 minutes for streaming path (near real-time target)
