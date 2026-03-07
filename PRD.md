@@ -570,12 +570,12 @@ A one-time backfill script generates **7 days of historical data** so gold table
 A **Databricks job (`mom_demo_live_data`)** with four tasks runs on-demand during the demo to generate fresh data, refresh the pipeline, and verify SLA compliance:
 
 ```
-                       ┌──→ refresh_pipeline ──────┐
-generate_batch_files ──┤                           ├──→ check_latency
-                       └──→ generate_stream_events ┘
+generate_batch_files ──┐
+                       ├──→ refresh_pipeline ──→ check_latency
+generate_stream_events ┘
 ```
 
-The pipeline refresh and stream producer run **in parallel** after batch files are generated. This ensures the pipeline is actively processing while new streaming events land, simulating real-time ingestion during a pipeline refresh cycle.
+Both generators run **in parallel** first, then the pipeline refreshes to process all new data (batch + stream files), then the latency monitor measures end-to-end time from generation to gold.
 
 #### Task 1: Batch File Generator (runs every 2 minutes)
 
