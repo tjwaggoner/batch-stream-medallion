@@ -1,151 +1,125 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Pipeline Latency & Throughput Monitor
-# MAGIC Measures per-layer latency (ingestion → gold) and throughput using the SDP event log.
-# MAGIC Logs results to `waggoner_mom.prebronze._latency_metrics`.
+# MAGIC Measures per-layer timing and throughput by comparing row counts and timestamps
+# MAGIC before and after the pipeline refresh.
 
 # COMMAND ----------
 
 spark.sql("USE CATALOG waggoner_mom")
 
-PIPELINE_ID = "2c9b65f9-3582-49f9-b1ee-43453f9b4dc9"
-EVENT_LOG_TABLE = f"prebronze.event_log_{PIPELINE_ID.replace('-', '_')}"
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Per-Layer Row Counts & Timestamps
+
+# COMMAND ----------
+
+layer_stats_df = spark.sql("""
+WITH prebronze_stats AS (
+  SELECT 'prebronze' AS layer,
+    COUNT(*) AS total_rows,
+    MIN(_ingested_at) AS earliest_ts,
+    MAX(_ingested_at) AS latest_ts
+  FROM prebronze.prebronze_alerts
+),
+bronze_stats AS (
+  SELECT 'bronze' AS layer,
+    COUNT(*) AS total_rows,
+    MIN(_ingested_at) AS earliest_ts,
+    MAX(_ingested_at) AS latest_ts
+  FROM bronze.bronze_alerts
+),
+silver_stats AS (
+  SELECT 'silver' AS layer,
+    (SELECT COUNT(*) FROM silver.silver_transactions) +
+    (SELECT COUNT(*) FROM silver.silver_users) +
+    (SELECT COUNT(*) FROM silver.silver_accounts) +
+    (SELECT COUNT(*) FROM silver.silver_alerts) AS total_rows,
+    NULL AS earliest_ts,
+    NULL AS latest_ts
+),
+gold_stats AS (
+  SELECT 'gold' AS layer,
+    (SELECT COUNT(*) FROM gold.gold_fact_daily_transactions) +
+    (SELECT COUNT(*) FROM gold.gold_fact_user_activity) +
+    (SELECT COUNT(*) FROM gold.gold_fact_risk_operations) +
+    (SELECT COUNT(*) FROM gold.gold_dim_users) +
+    (SELECT COUNT(*) FROM gold.gold_dim_accounts) +
+    (SELECT COUNT(*) FROM gold.gold_dim_cards) AS total_rows,
+    NULL AS earliest_ts,
+    NULL AS latest_ts
+)
+SELECT * FROM prebronze_stats
+UNION ALL SELECT * FROM bronze_stats
+UNION ALL SELECT * FROM silver_stats
+UNION ALL SELECT * FROM gold_stats
+""")
+
+layer_rows = layer_stats_df.collect()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Per-Layer Completion Times (from SDP Event Log)
+# MAGIC ## Pipeline Timing (from _ingested_at timestamps)
 
 # COMMAND ----------
 
-# Get the latest update's flow_progress events — these tell us when each dataset finished
-layer_timing_df = spark.sql(f"""
-WITH latest_update AS (
-  SELECT origin_update_id
-  FROM {EVENT_LOG_TABLE}
-  WHERE event_type = 'update_progress'
-  ORDER BY timestamp DESC
-  LIMIT 1
-),
-flow_events AS (
-  SELECT
-    origin_dataset_name AS dataset,
-    event_type,
-    timestamp AS completed_at,
-    details:flow_progress:metrics:num_output_rows AS rows_written,
-    details:flow_progress:status AS flow_status
-  FROM {EVENT_LOG_TABLE}
-  WHERE origin_update_id = (SELECT origin_update_id FROM latest_update)
-    AND event_type = 'flow_progress'
-    AND details:flow_progress:status = 'COMPLETED'
-)
+timing_df = spark.sql("""
 SELECT
-  dataset,
-  completed_at,
-  CAST(rows_written AS LONG) AS rows_written,
-  CASE
-    WHEN dataset LIKE 'prebronze%' THEN 'prebronze'
-    WHEN dataset LIKE 'bronze%' THEN 'bronze'
-    WHEN dataset LIKE 'silver%' THEN 'silver'
-    WHEN dataset LIKE 'gold%' THEN 'gold'
-    ELSE 'other'
-  END AS layer
-FROM flow_events
-ORDER BY completed_at
+  current_timestamp() AS monitor_ts,
+
+  -- Prebronze: when Auto Loader picked up the latest file
+  (SELECT MAX(_ingested_at) FROM prebronze.prebronze_alerts) AS prebronze_ingested_at,
+
+  -- Bronze: when the latest CDC merge wrote
+  (SELECT MAX(_ingested_at) FROM bronze.bronze_alerts) AS bronze_ingested_at,
+
+  -- Pipeline processing time: bronze ingestion - prebronze ingestion
+  ROUND(
+    unix_timestamp((SELECT MAX(_ingested_at) FROM bronze.bronze_alerts)) -
+    unix_timestamp((SELECT MAX(_ingested_at) FROM prebronze.prebronze_alerts)),
+  1) AS prebronze_to_bronze_sec,
+
+  -- Total pipeline time: now (post-refresh) - prebronze ingestion
+  ROUND(
+    unix_timestamp(current_timestamp()) -
+    unix_timestamp((SELECT MAX(_ingested_at) FROM prebronze.prebronze_alerts)),
+  1) AS ingestion_to_now_sec
 """)
 
-layer_timing_df.cache()
-display(layer_timing_df)
+timing = timing_df.collect()[0]
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Latency: Per-Layer Start & End Times
+# MAGIC ## Summary
 
 # COMMAND ----------
 
-layer_summary_df = spark.sql(f"""
-WITH latest_update AS (
-  SELECT origin_update_id
-  FROM {EVENT_LOG_TABLE}
-  WHERE event_type = 'update_progress'
-  ORDER BY timestamp DESC
-  LIMIT 1
-),
-flow_events AS (
-  SELECT
-    origin_dataset_name AS dataset,
-    timestamp AS completed_at,
-    CAST(details:flow_progress:metrics:num_output_rows AS LONG) AS rows_written,
-    CASE
-      WHEN origin_dataset_name LIKE 'prebronze%' THEN 'prebronze'
-      WHEN origin_dataset_name LIKE 'bronze%' THEN 'bronze'
-      WHEN origin_dataset_name LIKE 'silver%' THEN 'silver'
-      WHEN origin_dataset_name LIKE 'gold%' THEN 'gold'
-      ELSE 'other'
-    END AS layer
-  FROM {EVENT_LOG_TABLE}
-  WHERE origin_update_id = (SELECT origin_update_id FROM latest_update)
-    AND event_type = 'flow_progress'
-    AND details:flow_progress:status = 'COMPLETED'
-),
-layer_agg AS (
-  SELECT
-    layer,
-    MIN(completed_at) AS layer_start,
-    MAX(completed_at) AS layer_end,
-    SUM(rows_written) AS total_rows,
-    COUNT(*) AS datasets_completed
-  FROM flow_events
-  WHERE layer != 'other'
-  GROUP BY layer
-),
-pipeline_bounds AS (
-  SELECT
-    MIN(layer_start) AS pipeline_start,
-    MAX(layer_end) AS pipeline_end
-  FROM layer_agg
-)
-SELECT
-  la.layer,
-  la.layer_start,
-  la.layer_end,
-  ROUND(unix_timestamp(la.layer_end) - unix_timestamp(la.layer_start), 1) AS layer_duration_sec,
-  ROUND(unix_timestamp(la.layer_end) - unix_timestamp(pb.pipeline_start), 1) AS cumulative_sec,
-  la.total_rows,
-  la.datasets_completed,
-  ROUND(la.total_rows / NULLIF(unix_timestamp(la.layer_end) - unix_timestamp(la.layer_start), 0), 0) AS rows_per_sec
-FROM layer_agg la
-CROSS JOIN pipeline_bounds pb
-ORDER BY
-  CASE la.layer
-    WHEN 'prebronze' THEN 1
-    WHEN 'bronze' THEN 2
-    WHEN 'silver' THEN 3
-    WHEN 'gold' THEN 4
-  END
-""")
+print("=" * 70)
+print("  PIPELINE LATENCY & THROUGHPUT")
+print("=" * 70)
+print()
+print(f"  {'Layer':<12} {'Total Rows':>14} {'Latest Timestamp':>28}")
+print(f"  {'─'*12} {'─'*14} {'─'*28}")
+for r in layer_rows:
+    ts_str = str(r['latest_ts'])[:19] if r['latest_ts'] else '(materialized view)'
+    print(f"  {r['layer']:<12} {r['total_rows']:>14,} {ts_str:>28}")
 
-rows = layer_summary_df.collect()
+print()
+print(f"  ─── Timing ───")
+print(f"  Prebronze ingested at:     {timing['prebronze_ingested_at']}")
+print(f"  Bronze ingested at:        {timing['bronze_ingested_at']}")
+print(f"  Monitor ran at:            {timing['monitor_ts']}")
+print()
+print(f"  Prebronze → Bronze:        {timing['prebronze_to_bronze_sec']}s")
+print(f"  Ingestion → Gold (approx): {timing['ingestion_to_now_sec']}s")
+print()
 
-print("=" * 75)
-print("  PIPELINE LATENCY (ingestion → gold, from SDP event log)")
-print("=" * 75)
-print(f"  {'Layer':<12} {'Duration':>10} {'Cumulative':>12} {'Rows':>12} {'Rows/sec':>10} {'Tables':>8}")
-print(f"  {'─'*12} {'─'*10} {'─'*12} {'─'*12} {'─'*10} {'─'*8}")
-for r in rows:
-    dur = r['layer_duration_sec'] or 0
-    cum = r['cumulative_sec'] or 0
-    rps = r['rows_per_sec'] or 0
-    print(f"  {r['layer']:<12} {dur:>9.1f}s {cum:>11.1f}s {r['total_rows']:>12,} {rps:>10,.0f} {r['datasets_completed']:>8}")
-
-if rows:
-    total_dur = rows[-1]['cumulative_sec'] or 0
-    total_rows = sum(r['total_rows'] or 0 for r in rows)
-    print(f"  {'─'*12} {'─'*10} {'─'*12} {'─'*12} {'─'*10} {'─'*8}")
-    print(f"  {'TOTAL':<12} {'':<10} {total_dur:>11.1f}s {total_rows:>12,}")
-    print()
-    print(f"  Batch SLA (<15 min):  {'PASS' if total_dur < 900 else 'FAIL'} ({total_dur:.0f}s / 900s)")
+total_latency = timing['ingestion_to_now_sec'] or 0
+sla_pass = total_latency < 900
+print(f"  Batch SLA (<15 min):       {'PASS' if sla_pass else 'FAIL'} ({total_latency:.0f}s / 900s)")
 
 # COMMAND ----------
 
@@ -155,56 +129,59 @@ if rows:
 # COMMAND ----------
 
 spark.sql("DROP TABLE IF EXISTS waggoner_mom.prebronze._latency_metrics")
-layer_summary_df.write.mode("overwrite").saveAsTable("waggoner_mom.prebronze._latency_metrics")
+
+log_df = spark.sql(f"""
+SELECT
+  current_timestamp() AS run_ts,
+  'prebronze' AS layer, {layer_rows[0]['total_rows']} AS total_rows,
+  {timing['prebronze_to_bronze_sec'] or 0} AS layer_latency_sec,
+  {total_latency} AS cumulative_latency_sec
+UNION ALL SELECT current_timestamp(), 'bronze', {layer_rows[1]['total_rows']}, 0, 0
+UNION ALL SELECT current_timestamp(), 'silver', {layer_rows[2]['total_rows']}, 0, 0
+UNION ALL SELECT current_timestamp(), 'gold', {layer_rows[3]['total_rows']}, 0, {total_latency}
+""")
+log_df.write.mode("overwrite").saveAsTable("waggoner_mom.prebronze._latency_metrics")
 print("Logged to waggoner_mom.prebronze._latency_metrics")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Pipeline Latency Waterfall & Throughput
+# MAGIC ## Latency & Throughput Charts
 
 # COMMAND ----------
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-if rows:
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    fig.suptitle("Medallion Pipeline: Latency & Throughput", fontsize=14, fontweight="bold")
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle("Medallion Pipeline: Latency & Throughput", fontsize=14, fontweight="bold")
 
-    layers = [r['layer'] for r in rows]
-    durations = [r['layer_duration_sec'] or 0 for r in rows]
-    cumulatives = [r['cumulative_sec'] or 0 for r in rows]
-    total_rows_list = [r['total_rows'] or 0 for r in rows]
-    rps_list = [r['rows_per_sec'] or 0 for r in rows]
-    bar_colors = {"prebronze": "#3b82f6", "bronze": "#8b5cf6", "silver": "#f59e0b", "gold": "#10b981"}
-    colors = [bar_colors.get(l, "#999") for l in layers]
+layers = [r['layer'] for r in layer_rows]
+row_counts = [r['total_rows'] or 0 for r in layer_rows]
+bar_colors = {"prebronze": "#3b82f6", "bronze": "#8b5cf6", "silver": "#f59e0b", "gold": "#10b981"}
+colors = [bar_colors.get(l, "#999") for l in layers]
 
-    # --- Left: Waterfall (cumulative latency) ---
-    bottoms = [0] + cumulatives[:-1]
-    bars = ax1.bar(layers, durations, bottom=bottoms, color=colors, width=0.5, edgecolor="white", linewidth=1)
-    for i, (b, d, c) in enumerate(zip(bars, durations, cumulatives)):
-        if d > 0:
-            ax1.text(i, c + 1, f"+{d:.0f}s", ha="center", va="bottom", fontsize=10, fontweight="bold")
+# --- Left: Row counts per layer ---
+bars = ax1.bar(layers, row_counts, color=colors, width=0.5, edgecolor="white", linewidth=1)
+for i, (b, cnt) in enumerate(zip(bars, row_counts)):
+    ax1.text(i, cnt + max(row_counts) * 0.02, f"{cnt:,}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+ax1.set_ylabel("Total Rows")
+ax1.set_title("Rows per Layer")
+ax1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
 
-    total_dur = cumulatives[-1] if cumulatives else 0
-    ax1.axhline(y=900, color="red", linestyle="--", alpha=0.5, linewidth=1.5)
-    ax1.text(len(layers) - 0.5, 905, "SLA (15 min)", color="red", fontsize=9, ha="right")
-    ax1.set_ylabel("Cumulative Seconds")
-    sla_color = "#10b981" if total_dur < 900 else "#ef4444"
-    ax1.set_title(f"Latency: {total_dur:.0f}s total  |  {'PASS' if total_dur < 900 else 'FAIL'}",
-                  fontsize=11, color=sla_color)
+# --- Right: Timing breakdown ---
+timing_labels = ["Prebronze→Bronze", "Ingestion→Gold"]
+timing_values = [timing['prebronze_to_bronze_sec'] or 0, total_latency]
+timing_colors = ["#8b5cf6", "#10b981" if sla_pass else "#ef4444"]
 
-    # --- Right: Throughput (rows/sec per layer) ---
-    bars2 = ax2.bar(layers, rps_list, color=colors, width=0.5, edgecolor="white", linewidth=1)
-    for i, (b, rps, total) in enumerate(zip(bars2, rps_list, total_rows_list)):
-        ax2.text(i, rps + max(rps_list) * 0.02, f"{rps:,.0f}\n({total:,.0f} rows)",
-                 ha="center", va="bottom", fontsize=9)
-    ax2.set_ylabel("Rows / Second")
-    ax2.set_title("Throughput per Layer", fontsize=11)
-    ax2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
+bars2 = ax2.barh(timing_labels, timing_values, color=timing_colors, height=0.4)
+ax2.axvline(x=900, color="red", linestyle="--", alpha=0.5, linewidth=1.5, label="SLA (900s)")
+for i, (b, val) in enumerate(zip(bars2, timing_values)):
+    ax2.text(val + 5, i, f"{val:.0f}s", ha="left", va="center", fontsize=11, fontweight="bold")
+ax2.set_xlabel("Seconds")
+ax2.set_title(f"Pipeline Latency  |  {'PASS' if sla_pass else 'FAIL'}",
+              color="#10b981" if sla_pass else "#ef4444", fontsize=11)
+ax2.legend(fontsize=9)
 
-    plt.tight_layout()
-    plt.show()
-else:
-    print("No flow events found — run the pipeline first.")
+plt.tight_layout()
+plt.show()
