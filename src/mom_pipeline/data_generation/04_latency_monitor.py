@@ -173,20 +173,20 @@ def fmt_size(b):
 layer_order = ['prebronze', 'bronze', 'silver', 'gold']
 
 # --- Cost calculation ---
-total_pipeline_dbus = sum(r['total_dbus'] for r in cost_data) if cost_data else 0
-total_jobs_dbus = sum(r['total_dbus'] for r in jobs_cost_data) if jobs_cost_data else 0
+total_pipeline_dbus = float(sum(r['total_dbus'] for r in cost_data)) if cost_data else 0.0
+total_jobs_dbus = float(sum(r['total_dbus'] for r in jobs_cost_data)) if jobs_cost_data else 0.0
 
-pipeline_cost = 0
+pipeline_cost = 0.0
 for r in cost_data:
     sku = r['sku_name']
-    dbus = r['total_dbus']
+    dbus = float(r['total_dbus'])
     rate = next((v for k, v in PRICE_PER_DBU.items() if k in sku), 0.45)
     pipeline_cost += dbus * rate
 
-jobs_cost = 0
+jobs_cost = 0.0
 for r in jobs_cost_data:
     sku = r['sku_name']
-    dbus = r['total_dbus']
+    dbus = float(r['total_dbus'])
     rate = next((v for k, v in PRICE_PER_DBU.items() if k in sku), 0.45)
     jobs_cost += dbus * rate
 
