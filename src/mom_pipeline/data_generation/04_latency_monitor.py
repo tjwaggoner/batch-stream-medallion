@@ -104,7 +104,9 @@ print(f"  Status:                {'PASS' if row['stream_sla_pass'] else 'FAIL'}"
 
 # COMMAND ----------
 
-latency_df.write.mode("append").saveAsTable("waggoner_mom.prebronze._latency_metrics")
+# Drop and recreate to handle schema changes (metrics table, old data is stale)
+spark.sql("DROP TABLE IF EXISTS waggoner_mom.prebronze._latency_metrics")
+latency_df.write.mode("overwrite").saveAsTable("waggoner_mom.prebronze._latency_metrics")
 print("Logged to waggoner_mom.prebronze._latency_metrics")
 
 # COMMAND ----------
