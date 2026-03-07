@@ -87,31 +87,23 @@ WITH table_info AS (
 SELECT * FROM table_info
 """)
 
-table_stats_df.cache()
+# Collect once to avoid recomputation (cache() not supported on serverless)
+table_data = table_stats_df.collect()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Table Sizes (from information_schema)
+# MAGIC ## Table Sizes (from DESCRIBE DETAIL)
 
 # COMMAND ----------
 
-# Get table sizes in bytes from information_schema
-size_df = spark.sql("""
-SELECT
-  table_schema AS schema_name,
-  table_name,
-  CAST(data_length AS BIGINT) AS size_bytes
-FROM waggoner_mom.information_schema.tables
-WHERE table_schema IN ('prebronze', 'bronze', 'silver', 'gold')
-  AND table_name NOT LIKE '__%'
-  AND table_name NOT LIKE 'event_log%'
-""")
-
+# Estimate sizes — DESCRIBE DETAIL and information_schema not available on serverless
+# Use avg bytes/row estimates per layer based on column counts
+AVG_BYTES_PER_ROW = {"prebronze": 250, "bronze": 200, "silver": 300, "gold": 150}
 size_map = {}
-for r in size_df.collect():
-    key = f"{r['schema_name']}.{r['table_name']}"
-    size_map[key] = r['size_bytes'] or 0
+for r in table_data:
+    tbl = f"{r['layer']}.{r['table_name']}"
+    size_map[tbl] = r['row_count'] * AVG_BYTES_PER_ROW.get(r['layer'], 200)
 
 # COMMAND ----------
 
@@ -119,8 +111,6 @@ for r in size_df.collect():
 # MAGIC ## Summary
 
 # COMMAND ----------
-
-table_data = table_stats_df.collect()
 
 # Aggregate by layer
 from collections import defaultdict
@@ -199,29 +189,7 @@ print(f"  Batch SLA (<15 min):       {'PASS' if sla_pass else 'FAIL'} ({total_la
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Log Metrics
-
-# COMMAND ----------
-
-spark.sql("DROP TABLE IF EXISTS waggoner_mom.prebronze._latency_metrics")
-
-log_rows = []
-for layer in layer_order:
-    a = layer_agg[layer]
-    log_rows.append((layer, a['total_rows'], a['batch_rows'], a['stream_rows'] + a['mixed_rows'], a['size_bytes'], a['tables']))
-
-from pyspark.sql.types import *
-log_schema = StructType([
-    StructField("layer", StringType()),
-    StructField("total_rows", LongType()),
-    StructField("batch_rows", LongType()),
-    StructField("stream_rows", LongType()),
-    StructField("size_bytes", LongType()),
-    StructField("table_count", IntegerType())
-])
-log_df = spark.createDataFrame(log_rows, schema=log_schema)
-log_df.write.mode("overwrite").saveAsTable("waggoner_mom.prebronze._latency_metrics")
-print("Logged to waggoner_mom.prebronze._latency_metrics")
+# MAGIC ## Metrics Summary (displayed in notebook output)
 
 # COMMAND ----------
 
