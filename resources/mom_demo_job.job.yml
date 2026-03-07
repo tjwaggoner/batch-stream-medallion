@@ -2,9 +2,6 @@ resources:
   jobs:
     mom_demo_job:
       name: "mom_demo_live_data"
-      # Pipeline must be running in continuous mode BEFORE triggering this job.
-      # Start it with: databricks bundle run mom_pipeline
-      # Stop it after demo: databricks pipelines stop <pipeline_id>
       tasks:
         # Step 1: Generate batch files + stream events in parallel
         - task_key: generate_batch_files
@@ -21,23 +18,20 @@ resources:
           environment_key: default
           timeout_seconds: 300
 
-        # Step 2: Wait for pipeline to process new data
-        # Pipeline is running continuously and picks up files automatically.
-        # Wait 3 minutes to allow full processing through all 4 layers.
-        - task_key: wait_for_processing
+        # Step 2: Refresh pipeline to process all new data
+        - task_key: refresh_pipeline
           depends_on:
             - task_key: generate_batch_files
             - task_key: generate_stream_events
-          notebook_task:
-            notebook_path: /Workspace/Users/tanner.waggoner@databricks.com/mom_data_generation/wait_for_processing
-            source: WORKSPACE
-          environment_key: default
-          timeout_seconds: 300
+          pipeline_task:
+            pipeline_id: 2c9b65f9-3582-49f9-b1ee-43453f9b4dc9
+            full_refresh: false
+          timeout_seconds: 600
 
         # Step 3: Measure latency
         - task_key: check_latency
           depends_on:
-            - task_key: wait_for_processing
+            - task_key: refresh_pipeline
           notebook_task:
             notebook_path: /Workspace/Users/tanner.waggoner@databricks.com/mom_data_generation/04_latency_monitor
             source: WORKSPACE
