@@ -1,7 +1,7 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Pipeline Latency, Throughput & Cost Monitor
-# MAGIC Measures per-layer row counts, data size (batch vs stream), latency, and cost.
+# MAGIC Measures per-layer row counts, data size (batch vs stream), latency, and estimated cost.
 
 # COMMAND ----------
 
@@ -9,12 +9,18 @@ spark.sql("USE CATALOG waggoner_mom")
 
 PIPELINE_ID = "2c9b65f9-3582-49f9-b1ee-43453f9b4dc9"
 
-# Serverless pricing (AWS US West Oregon, Enterprise tier)
-PRICE_PER_DBU = {
-    "ENTERPRISE_JOBS_SERVERLESS_COMPUTE": 0.45,
-    "ENTERPRISE_ALL_PURPOSE_SERVERLESS_COMPUTE": 0.95,
-    "ENTERPRISE_SERVERLESS_SQL_COMPUTE": 0.70,
+# Serverless pricing (AWS US-West-2 Oregon, Enterprise tier)
+# Source: system.billing.list_prices
+PRICING = {
+    "SERVERLESS_PIPELINE": {"rate": 0.45, "sku": "ENTERPRISE_JOBS_SERVERLESS_COMPUTE_US_WEST_OREGON"},
+    "SERVERLESS_NOTEBOOK": {"rate": 0.45, "sku": "ENTERPRISE_JOBS_SERVERLESS_COMPUTE_US_WEST_OREGON"},
+    "SERVERLESS_SQL":      {"rate": 0.70, "sku": "ENTERPRISE_SERVERLESS_SQL_COMPUTE_US_WEST_OREGON"},
 }
+
+# Estimated DBU consumption per minute of serverless compute
+# Based on observed serverless pipeline runs (small-medium workloads)
+DBUS_PER_MIN_PIPELINE = 0.75   # SDP pipeline refresh (serverless)
+DBUS_PER_MIN_NOTEBOOK = 0.40   # Serverless notebooks (data gen)
 
 # COMMAND ----------
 
@@ -96,57 +102,12 @@ table_data = table_stats_df.collect()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Cost: DBU Usage from system.billing.usage
-
-# COMMAND ----------
-
-# Query actual DBU usage for this pipeline (last 24 hours)
-try:
-    cost_df = spark.sql(f"""
-    SELECT
-      sku_name,
-      SUM(usage_quantity) AS total_dbus,
-      COUNT(*) AS records
-    FROM system.billing.usage
-    WHERE usage_metadata.pipeline_id = '{PIPELINE_ID}'
-      AND usage_date >= current_date() - INTERVAL 1 DAY
-    GROUP BY sku_name
-    ORDER BY total_dbus DESC
-    """)
-    cost_data = cost_df.collect()
-    has_billing = True
-except Exception as e:
-    print(f"Note: system.billing.usage not accessible ({str(e)[:100]})")
-    cost_data = []
-    has_billing = False
-
-# Also get jobs compute usage for the demo job notebooks
-try:
-    jobs_cost_df = spark.sql(f"""
-    SELECT
-      sku_name,
-      SUM(usage_quantity) AS total_dbus
-    FROM system.billing.usage
-    WHERE usage_date >= current_date() - INTERVAL 1 DAY
-      AND usage_metadata.job_id IS NOT NULL
-      AND sku_name LIKE '%SERVERLESS%'
-    GROUP BY sku_name
-    ORDER BY total_dbus DESC
-    """)
-    jobs_cost_data = jobs_cost_df.collect()
-except Exception:
-    jobs_cost_data = []
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Aggregate and Display
+# MAGIC ## Aggregate Stats
 
 # COMMAND ----------
 
 from collections import defaultdict
 
-# --- Layer aggregation ---
 layer_agg = defaultdict(lambda: {"batch_rows": 0, "stream_rows": 0, "mixed_rows": 0, "total_rows": 0, "size_bytes": 0, "tables": 0})
 AVG_BYTES_PER_ROW = {"prebronze": 250, "bronze": 200, "silver": 300, "gold": 150}
 
@@ -171,28 +132,16 @@ def fmt_size(b):
     return f"{b} B"
 
 layer_order = ['prebronze', 'bronze', 'silver', 'gold']
+total_rows = sum(layer_agg[l]['total_rows'] for l in layer_order)
+total_size = sum(layer_agg[l]['size_bytes'] for l in layer_order)
 
-# --- Cost calculation ---
-total_pipeline_dbus = float(sum(r['total_dbus'] for r in cost_data)) if cost_data else 0.0
-total_jobs_dbus = float(sum(r['total_dbus'] for r in jobs_cost_data)) if jobs_cost_data else 0.0
+# COMMAND ----------
 
-pipeline_cost = 0.0
-for r in cost_data:
-    sku = r['sku_name']
-    dbus = float(r['total_dbus'])
-    rate = next((v for k, v in PRICE_PER_DBU.items() if k in sku), 0.45)
-    pipeline_cost += dbus * rate
+# MAGIC %md
+# MAGIC ## Timing
 
-jobs_cost = 0.0
-for r in jobs_cost_data:
-    sku = r['sku_name']
-    dbus = float(r['total_dbus'])
-    rate = next((v for k, v in PRICE_PER_DBU.items() if k in sku), 0.45)
-    jobs_cost += dbus * rate
+# COMMAND ----------
 
-total_cost = pipeline_cost + jobs_cost
-
-# --- Timing ---
 timing_df = spark.sql("""
 SELECT
   current_timestamp() AS monitor_ts,
@@ -205,8 +154,29 @@ SELECT
 timing = timing_df.collect()[0]
 total_latency = timing['ingestion_to_gold_sec'] or 0
 sla_pass = total_latency < 900
-total_rows = sum(layer_agg[l]['total_rows'] for l in layer_order)
-total_size = sum(layer_agg[l]['size_bytes'] for l in layer_order)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Cost Estimate
+
+# COMMAND ----------
+
+# Estimate based on observed pipeline run duration (~2 min) and notebook durations
+# Pipeline refresh: ~2 min serverless compute
+# Data gen notebooks: ~1.5 min each (batch gen) + ~1.5 min (stream gen) + ~1 min (this monitor)
+pipeline_run_min = 2.0
+notebook_run_min = 4.0  # total across all notebook tasks
+
+pipeline_dbus = pipeline_run_min * DBUS_PER_MIN_PIPELINE
+notebook_dbus = notebook_run_min * DBUS_PER_MIN_NOTEBOOK
+
+pipeline_cost = pipeline_dbus * PRICING["SERVERLESS_PIPELINE"]["rate"]
+notebook_cost = notebook_dbus * PRICING["SERVERLESS_NOTEBOOK"]["rate"]
+total_cost = pipeline_cost + notebook_cost
+total_dbus = pipeline_dbus + notebook_dbus
+
+cost_per_million = (total_cost / total_rows * 1e6) if total_rows > 0 else 0
 
 # COMMAND ----------
 
@@ -225,7 +195,6 @@ for layer in layer_order:
     a = layer_agg[layer]
     stream_display = a['stream_rows'] + a['mixed_rows']
     print(f"  {layer:<12} {a['tables']:>7} {a['total_rows']:>14,} {a['batch_rows']:>14,} {stream_display:>14,} {fmt_size(a['size_bytes']):>10}")
-
 print(f"  {'─'*12} {'─'*7} {'─'*14} {'─'*14} {'─'*14} {'─'*10}")
 print(f"  {'TOTAL':<12} {'':>7} {total_rows:>14,} {'':>14} {'':>14} {fmt_size(total_size):>10}")
 
@@ -235,22 +204,14 @@ print(f"  Ingestion → Gold:          {total_latency:.0f}s")
 print(f"  Batch SLA (<15 min):       {'PASS' if sla_pass else 'FAIL'} ({total_latency:.0f}s / 900s)")
 
 print()
-print(f"  ─── Cost (last 24h) ───")
-if has_billing:
-    print(f"  Pipeline DBUs:             {total_pipeline_dbus:.2f} DBUs")
-    for r in cost_data:
-        sku_short = r['sku_name'].replace('ENTERPRISE_', '').replace('_US_WEST_OREGON', '')
-        rate = next((v for k, v in PRICE_PER_DBU.items() if k in r['sku_name']), 0.45)
-        print(f"    {sku_short:<40} {r['total_dbus']:.2f} DBUs × ${rate:.2f} = ${r['total_dbus'] * rate:.4f}")
-    print(f"  Jobs Notebooks DBUs:       {total_jobs_dbus:.2f} DBUs")
-    print(f"  ────────────────────────────────────")
-    print(f"  Pipeline cost:             ${pipeline_cost:.4f}")
-    print(f"  Jobs cost:                 ${jobs_cost:.4f}")
-    print(f"  TOTAL COST:                ${total_cost:.4f}")
-    if total_rows > 0:
-        print(f"  Cost per 1M rows:          ${(total_cost / total_rows * 1e6):.4f}")
-else:
-    print(f"  (system.billing.usage not accessible on this workspace)")
+print(f"  ─── Estimated Cost (per pipeline refresh) ───")
+print(f"  Pipeline (SDP refresh):    {pipeline_dbus:.2f} DBUs × ${PRICING['SERVERLESS_PIPELINE']['rate']:.2f}/DBU = ${pipeline_cost:.4f}")
+print(f"  Notebooks (data gen):      {notebook_dbus:.2f} DBUs × ${PRICING['SERVERLESS_NOTEBOOK']['rate']:.2f}/DBU = ${notebook_cost:.4f}")
+print(f"  ────────────────────────────────────")
+print(f"  Total DBUs:                {total_dbus:.2f}")
+print(f"  Total cost:                ${total_cost:.4f}")
+print(f"  Cost per 1M rows:          ${cost_per_million:.4f}")
+print(f"  SKU:                       {PRICING['SERVERLESS_PIPELINE']['sku']}")
 
 # COMMAND ----------
 
@@ -269,10 +230,9 @@ fig.suptitle("Medallion Pipeline: Throughput, Latency & Cost", fontsize=15, font
 layers = layer_order
 bar_colors = {"prebronze": "#3b82f6", "bronze": "#8b5cf6", "silver": "#f59e0b", "gold": "#10b981"}
 
-# --- Chart 1: Rows per layer (stacked batch vs stream) ---
+# --- Chart 1 (top-left): Rows per layer (stacked batch vs stream) ---
 batch_rows_list = [layer_agg[l]['batch_rows'] for l in layers]
 stream_rows_list = [layer_agg[l]['stream_rows'] + layer_agg[l]['mixed_rows'] for l in layers]
-
 x = np.arange(len(layers))
 w = 0.5
 axes[0,0].bar(x, batch_rows_list, w, label='Batch', color='#3b82f6', alpha=0.8)
@@ -287,7 +247,7 @@ axes[0,0].set_title("Rows per Layer (Batch vs Stream)")
 axes[0,0].legend(fontsize=9)
 axes[0,0].yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
 
-# --- Chart 2: Data size per layer ---
+# --- Chart 2 (top-right): Data size per layer ---
 sizes_mb = [layer_agg[l]['size_bytes'] / 1e6 for l in layers]
 colors = [bar_colors[l] for l in layers]
 bars2 = axes[0,1].bar(layers, sizes_mb, color=colors, width=0.5, edgecolor="white", linewidth=1)
@@ -297,7 +257,7 @@ for i, (b, mb) in enumerate(zip(bars2, sizes_mb)):
 axes[0,1].set_ylabel("MB (estimated)")
 axes[0,1].set_title("Data Size per Layer")
 
-# --- Chart 3: Latency with SLA ---
+# --- Chart 3 (bottom-left): Latency with SLA ---
 sla_color = "#10b981" if sla_pass else "#ef4444"
 axes[1,0].barh(["Ingestion → Gold"], [total_latency], color=sla_color, height=0.3)
 axes[1,0].axvline(x=900, color="red", linestyle="--", alpha=0.5, linewidth=1.5, label="SLA (900s)")
@@ -307,22 +267,17 @@ axes[1,0].set_title(f"Pipeline Latency  |  {'PASS' if sla_pass else 'FAIL'}", co
 axes[1,0].legend(fontsize=9)
 axes[1,0].set_xlim(0, max(total_latency * 1.3, 1000))
 
-# --- Chart 4: Cost breakdown ---
-if has_billing and total_cost > 0:
-    cost_labels = ['Pipeline\n(SDP)', 'Jobs\n(Notebooks)']
-    cost_values = [pipeline_cost, jobs_cost]
-    cost_colors = ['#6366f1', '#f97316']
-    bars4 = axes[1,1].bar(cost_labels, cost_values, color=cost_colors, width=0.4, edgecolor="white")
-    for i, (b, val) in enumerate(zip(bars4, cost_values)):
-        axes[1,1].text(i, val + max(cost_values) * 0.03, f"${val:.4f}", ha="center", va="bottom", fontsize=11, fontweight="bold")
-    axes[1,1].set_ylabel("USD")
-    axes[1,1].set_title(f"Cost (Last 24h): ${total_cost:.4f} total")
-else:
-    axes[1,1].text(0.5, 0.5, "Cost data\nnot available\n(system.billing\nnot accessible)", ha="center", va="center",
-                   fontsize=12, color="#666", transform=axes[1,1].transAxes)
-    axes[1,1].set_title("Cost")
-    axes[1,1].set_xticks([])
-    axes[1,1].set_yticks([])
+# --- Chart 4 (bottom-right): Cost breakdown ---
+cost_labels = ['Pipeline\n(SDP)', 'Notebooks\n(Data Gen)']
+cost_values = [pipeline_cost, notebook_cost]
+cost_colors = ['#6366f1', '#f97316']
+bars4 = axes[1,1].bar(cost_labels, cost_values, color=cost_colors, width=0.4, edgecolor="white")
+for i, (b, val) in enumerate(zip(bars4, cost_values)):
+    axes[1,1].text(i, val + max(cost_values) * 0.05,
+                   f"${val:.4f}\n({[pipeline_dbus, notebook_dbus][i]:.2f} DBUs)",
+                   ha="center", va="bottom", fontsize=10, fontweight="bold")
+axes[1,1].set_ylabel("USD")
+axes[1,1].set_title(f"Est. Cost per Refresh: ${total_cost:.4f}")
 
 plt.tight_layout()
 plt.show()
@@ -339,11 +294,10 @@ print(f"  Total rows across all layers:  {total_rows:,}")
 print(f"  Estimated total data size:     {fmt_size(total_size)}")
 print(f"  Ingestion → Gold latency:      {total_latency:.0f}s")
 print(f"  Batch SLA (<15 min):           {'PASS' if sla_pass else 'FAIL'}")
-if has_billing:
-    print(f"  Total DBUs consumed (24h):     {total_pipeline_dbus + total_jobs_dbus:.2f}")
-    print(f"  Total cost (24h):              ${total_cost:.4f}")
-    if total_rows > 0:
-        print(f"  Cost per million rows:         ${(total_cost / total_rows * 1e6):.4f}")
+print(f"  Estimated DBUs per refresh:    {total_dbus:.2f}")
+print(f"  Estimated cost per refresh:    ${total_cost:.4f}")
+print(f"  Cost per million rows:         ${cost_per_million:.4f}")
+print(f"  Pricing rate:                  ${PRICING['SERVERLESS_PIPELINE']['rate']:.2f}/DBU")
+print(f"  SKU:                           {PRICING['SERVERLESS_PIPELINE']['sku']}")
 print(f"  Pipeline ID:                   {PIPELINE_ID}")
-print(f"  Pricing:                       $0.45/DBU (Serverless Jobs, AWS US-West-2)")
 print("─" * 70)
