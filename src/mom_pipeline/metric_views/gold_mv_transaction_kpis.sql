@@ -26,7 +26,7 @@ measures:
     agg: avg
 materialization:
   schedule:
-    cron: "0 */2 * * *"
+    cron: "* * * * *"
   mode: relaxed
   materialized_views:
     - name: txn_kpis_by_type_date

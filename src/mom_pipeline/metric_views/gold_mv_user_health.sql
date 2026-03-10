@@ -24,7 +24,7 @@ measures:
     agg: sum
 materialization:
   schedule:
-    cron: "0 */2 * * *"
+    cron: "* * * * *"
   mode: relaxed
   materialized_views:
     - name: user_health_monthly

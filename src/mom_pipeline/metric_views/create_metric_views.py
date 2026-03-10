@@ -31,7 +31,7 @@ measures:
   - name: avg_transaction_value
     expr: SUM(total_amount) / NULLIF(SUM(txn_count), 0)
 materialization:
-  schedule: every 2 hours
+  schedule: every 1 minute
   mode: relaxed
   materialized_views:
     - name: txn_kpis_by_type_date
@@ -69,7 +69,7 @@ measures:
   - name: total_alerts
     expr: SUM(alert_count)
 materialization:
-  schedule: every 2 hours
+  schedule: every 1 minute
   mode: relaxed
   materialized_views:
     - name: user_health_monthly
@@ -108,7 +108,7 @@ measures:
   - name: avg_disputed_amount
     expr: AVG(avg_disputed_amount)
 materialization:
-  schedule: every 2 hours
+  schedule: every 1 minute
   mode: relaxed
   materialized_views:
     - name: risk_ops_monthly

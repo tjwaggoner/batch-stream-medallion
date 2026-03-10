@@ -27,7 +27,7 @@ measures:
     agg: avg
 materialization:
   schedule:
-    cron: "0 */2 * * *"
+    cron: "* * * * *"
   mode: relaxed
   materialized_views:
     - name: risk_ops_monthly
