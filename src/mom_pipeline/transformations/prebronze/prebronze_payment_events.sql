@@ -1,4 +1,5 @@
 CREATE OR REFRESH STREAMING TABLE prebronze_payment_events
+(CONSTRAINT valid_event_id EXPECT (event_id IS NOT NULL) ON VIOLATION DROP ROW)
 CLUSTER BY (event_ts)
 AS
 SELECT
