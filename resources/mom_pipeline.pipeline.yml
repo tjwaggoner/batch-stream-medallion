@@ -4,12 +4,14 @@ resources:
       name: "mom_medallion_pipeline"
       catalog: "waggoner_mom"
       schema: "prebronze"
+      continuous: true
       configuration:
         bronze_schema: "bronze"
         silver_schema: "silver"
         gold_schema: "gold"
         source_volume: "/Volumes/waggoner_mom/prebronze/partner_files"
         schema_location_base: "/Volumes/waggoner_mom/prebronze/pipeline_metadata/schemas"
+        pipelines.trigger.interval: "500 milliseconds"
       libraries:
         - glob:
             include: ../src/mom_pipeline/transformations/**
